@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -61,6 +62,11 @@ type APIError struct {
 	Summary    string
 	RetryAfter time.Duration
 	Body       string
+
+	// Retried reports that an earlier attempt of this same request ended without a definitive
+	// answer (a transport error or a 5xx), so this 409 may describe a write that earlier attempt
+	// already applied. A non-idempotent caller reads it through WriteOutcomeUnknown.
+	Retried bool
 }
 
 func (e *APIError) Error() string {
@@ -77,6 +83,61 @@ func (e *APIError) HasPrefix(prefix string) bool { return strings.HasPrefix(e.Su
 func HasSummary(err error, part string) bool {
 	var ae *APIError
 	return errors.As(err, &ae) && strings.Contains(ae.Summary, part)
+}
+
+// ambiguousTransportError marks a request whose earlier attempt got no answer and whose final
+// attempt also ended without one. The write may have reached Dropbox, so callers must reconcile it
+// instead of reporting a confirmed failure. A transport error on a fresh request is not wrapped:
+// that attempt never reached the server.
+type ambiguousTransportError struct{ err error }
+
+func (e *ambiguousTransportError) Error() string { return e.err.Error() }
+func (e *ambiguousTransportError) Unwrap() error { return e.err }
+
+// WriteOutcomeUnknown reports whether a failed non-idempotent write may have been applied. It is
+// true for a retried request whose earlier attempt got no definitive answer, and for a request
+// whose final transport attempt ended without one. A missing APIError alone is not enough: a local
+// build error or a cancellation is not an ambiguous write.
+func WriteOutcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return ae.Retried
+	}
+	var te *ambiguousTransportError
+	return errors.As(err, &te)
+}
+
+// ambiguousFailure wraps err only when an earlier attempt was already ambiguous, so cancellation
+// and sleep deadlines after an unanswered attempt still report an unknown write.
+func ambiguousFailure(ambiguous bool, err error) error {
+	if ambiguous {
+		return &ambiguousTransportError{err: err}
+	}
+	return err
+}
+
+// retryMarker records, per request, whether an earlier attempt got no answer. A batch call returns
+// per-entry results rather than one APIError, so it carries this marker to know whether a failure
+// summary may describe an earlier attempt that was already applied.
+type retryMarker struct{ ambiguous atomic.Bool }
+
+type retryMarkerKey struct{}
+
+func withRetryMarker(ctx context.Context) (context.Context, *retryMarker) {
+	if m, ok := ctx.Value(retryMarkerKey{}).(*retryMarker); ok {
+		return ctx, m
+	}
+	m := &retryMarker{}
+	return context.WithValue(ctx, retryMarkerKey{}, m), m
+}
+
+func markRetried(ctx context.Context) {
+	if m, ok := ctx.Value(retryMarkerKey{}).(*retryMarker); ok {
+		m.ambiguous.Store(true)
+	}
 }
 
 // ErrReauth means the refresh token was rejected; the account must be re-authorized.
@@ -318,6 +379,9 @@ func (c *Client) do(ctx context.Context, build func(token string) (*http.Request
 		return nil, err
 	}
 	refreshed := false
+	// ambiguous records that an earlier attempt got no answer, so a later 409 can describe a write
+	// this request already applied. A 429 is not ambiguous: Dropbox answered without applying it.
+	ambiguous := false
 	for attempt := 0; ; attempt++ {
 		req, err := build(token)
 		if err != nil {
@@ -326,10 +390,12 @@ func (c *Client) do(ctx context.Context, build func(token string) (*http.Request
 		resp, err := c.http.Do(req)
 		if err != nil {
 			if ctx.Err() != nil || attempt >= 2 {
-				return nil, err
+				return nil, ambiguousFailure(ambiguous || attempt >= 2, err)
 			}
+			ambiguous = true
+			markRetried(ctx)
 			if err := sleep(ctx, backoff(attempt)); err != nil {
-				return nil, err
+				return nil, ambiguousFailure(ambiguous, err)
 			}
 			continue
 		}
@@ -337,6 +403,7 @@ func (c *Client) do(ctx context.Context, build func(token string) (*http.Request
 			return resp, nil
 		}
 		apiErr := readError(resp)
+		apiErr.Retried = ambiguous
 		switch {
 		case resp.StatusCode == http.StatusUnauthorized && !refreshed && !apiErr.HasPrefix("missing_scope"):
 			refreshed = true
@@ -353,12 +420,14 @@ func (c *Client) do(ctx context.Context, build func(token string) (*http.Request
 				return nil, apiErr
 			}
 			if err := sleep(ctx, wait); err != nil {
-				return nil, err
+				return nil, ambiguousFailure(ambiguous, err)
 			}
 			continue
 		case (resp.StatusCode == 500 || resp.StatusCode == 502 || resp.StatusCode == 503) && attempt < 2:
+			ambiguous = true
+			markRetried(ctx)
 			if err := sleep(ctx, backoff(attempt)); err != nil {
-				return nil, err
+				return nil, ambiguousFailure(ambiguous, err)
 			}
 			continue
 		}

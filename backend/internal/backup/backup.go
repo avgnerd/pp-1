@@ -501,7 +501,7 @@ func readPayload(ctx context.Context, d *sql.DB, box *secret.Box, exportedAt str
 		}
 		rec.CreatedAt = unixToRFC3339(createdAt)
 		rec.UpdatedAt = unixToRFC3339(updatedAt)
-		rec.AuthorizedAt = unixToRFC3339(authorizedAt)
+		rec.AuthorizedAt = millisToRFC3339(authorizedAt)
 		if rec.AppSecret, err = openCredential(box, appSecretEnc, rec); err != nil {
 			srows.Close()
 			return nil, err
@@ -568,4 +568,28 @@ func parseRFC3339(s string) (int64, bool) {
 		return 0, false
 	}
 	return t.Unix(), true
+}
+
+// millisToRFC3339 renders a unix millisecond timestamp, keeping the milliseconds in a fraction;
+// zero becomes the empty string. authorized_at is stored in milliseconds, and rendering it as
+// seconds wrote a year far past RFC 3339's four-digit range (58820), which the restore could not
+// parse, so every round trip reset the value to 0.
+func millisToRFC3339(ms int64) string {
+	if ms == 0 {
+		return ""
+	}
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339Nano)
+}
+
+// parseRFC3339Millis reads an RFC 3339 timestamp into unix milliseconds. RFC3339 parsing accepts
+// the optional fractional second millisToRFC3339 writes, so the value survives the round trip.
+func parseRFC3339Millis(s string) (int64, bool) {
+	if strings.TrimSpace(s) == "" {
+		return 0, false
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return 0, false
+	}
+	return t.UnixMilli(), true
 }

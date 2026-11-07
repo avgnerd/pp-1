@@ -342,16 +342,29 @@ func sse(c *gin.Context) func(event string, v any) bool {
 }
 
 func (s *Server) folderSize(c *gin.Context) {
-	ctx := c.Request.Context()
+	// A child context lets the handler stop the scan when it returns, including on the
+	// write-failure path, where the request context is still live and a goroutine blocked on a
+	// send the handler will never receive would leak for the life of the request's connection.
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
 	send := sse(c)
 	type msg struct {
 		event string
 		v     any
 	}
+	vpath := c.Query("path")
 	ch := make(chan msg, 16)
+	// deliver waits for the handler to take a final message, or gives up when the handler is gone.
+	// Progress uses the non-blocking path below because a dropped progress update is harmless.
+	deliver := func(m msg) {
+		select {
+		case ch <- m:
+		case <-ctx.Done():
+		}
+	}
 	go func() {
 		defer close(ch)
-		p, err := s.VFS.FolderSize(ctx, c.Query("path"), s.FolderSizeLim, func(p vfs.SizeProgress) {
+		p, err := s.VFS.FolderSize(ctx, vpath, s.FolderSizeLim, func(p vfs.SizeProgress) {
 			select {
 			case ch <- msg{"progress", p}:
 			default: // drop progress if the client is slow
@@ -359,11 +372,11 @@ func (s *Server) folderSize(c *gin.Context) {
 		})
 		if err != nil {
 			if ctx.Err() == nil {
-				ch <- msg{"error", gin.H{"error": errorText(err)}}
+				deliver(msg{"error", gin.H{"error": errorText(err)}})
 			}
 			return
 		}
-		ch <- msg{"done", p}
+		deliver(msg{"done", p})
 	}()
 	tick := time.NewTicker(15 * time.Second)
 	defer tick.Stop()
@@ -424,7 +437,7 @@ func (s *Server) rename(c *gin.Context) {
 		fail(c, badRequest(err.Error()))
 		return
 	}
-	_, t, err := s.opTarget(c.Request.Context(), in.Path)
+	e, t, err := s.opTarget(c.Request.Context(), in.Path)
 	if err != nil {
 		fail(c, err)
 		return
@@ -435,18 +448,67 @@ func (s *Server) rename(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	if err := cl.Move(c.Request.Context(), t.DbxPath, to); err != nil {
-		fail(c, err)
-		return
-	}
+	ctx := c.Request.Context()
+	reloc := dropbox.Relocation{Op: dropbox.OpMove, From: t.DbxPath, To: to, Name: in.Name, SourceID: e.ID, SourceRev: e.Rev}
+	err = cl.Move(ctx, t.DbxPath, to)
+	// Invalidate before judging the outcome: Dropbox may have applied the move and lost the
+	// response, and a cached listing would keep showing the old name for a full cache TTL.
 	s.VFS.InvalidatePath(t.Storage.ID, t.DbxPath)
 	s.VFS.InvalidatePath(t.Storage.ID, to)
+	if err != nil {
+		if !dropbox.WriteOutcomeUnknown(err) {
+			fail(c, err)
+			return
+		}
+		switch cl.ReconcileRelocation(ctx, reloc) {
+		case dropbox.RelocationApplied:
+			// The destination carries the source id, so the move is confirmed despite the error.
+		case dropbox.RelocationFailed:
+			fail(c, err)
+			return
+		default:
+			failWriteUnknown(c, err)
+			return
+		}
+	}
 	c.JSON(200, gin.H{"ok": true, "path": path.Join(pathutil.Parent(t.VPath), in.Name)})
 }
 
+// failWriteUnknown reports a write whose outcome metadata could not confirm. It is deliberately
+// neither success nor a confirmed failure: the client must refresh the listing before retrying.
+func failWriteUnknown(c *gin.Context, err error) {
+	detail := ""
+	if err != nil {
+		detail = errorText(err)
+	}
+	c.JSON(http.StatusBadGateway, gin.H{
+		"error":   "Dropbox 쓰기 결과를 확인할 수 없습니다. 목록을 새로고침한 뒤 다시 시도하세요",
+		"detail":  detail,
+		"unknown": true,
+	})
+}
+
+// unknownWriteMessage is the per-entry form of failWriteUnknown for batch responses, where one
+// entry can be unknown while the rest of the batch succeeded.
+func unknownWriteMessage(err error) string {
+	msg := "Dropbox 쓰기 결과를 확인할 수 없습니다. 목록을 새로고침한 뒤 다시 시도하세요"
+	if err != nil {
+		msg += ": " + errorText(err)
+	}
+	return msg
+}
+
+// relocationMayBeApplied reports whether a per-entry batch failure is one a retried attempt can
+// report for an entry it already moved or copied. Other failures never need the extra metadata
+// lookups reconciliation costs.
+func relocationMayBeApplied(summary string) bool {
+	return strings.Contains(summary, "not_found") || strings.Contains(summary, "conflict")
+}
+
 type opFailure struct {
-	Path  string `json:"path"`
-	Error string `json:"error"`
+	Path    string `json:"path"`
+	Error   string `json:"error"`
+	Unknown bool   `json:"unknown,omitempty"`
 }
 
 func (s *Server) moveCopy(move bool) gin.HandlerFunc {
@@ -475,8 +537,9 @@ func (s *Server) moveCopy(move bool) gin.HandlerFunc {
 		}
 		var entries []dropbox.RelocationEntry
 		var vpaths []string
+		var entryIDs, entryRevs []string
 		for _, p := range in.Paths {
-			_, t, err := s.opTarget(ctx, p)
+			e, t, err := s.opTarget(ctx, p)
 			if err != nil {
 				fail(c, err)
 				return
@@ -495,43 +558,102 @@ func (s *Server) moveCopy(move bool) gin.HandlerFunc {
 			}
 			entries = append(entries, dropbox.RelocationEntry{FromPath: t.DbxPath, ToPath: path.Join(dt.DbxPath, path.Base(t.DbxPath))})
 			vpaths = append(vpaths, p)
+			entryIDs = append(entryIDs, e.ID)
+			entryRevs = append(entryRevs, e.Rev)
 		}
 		cl, err := s.St.Client(dt.Storage.ID)
 		if err != nil {
 			fail(c, err)
 			return
 		}
+		op := dropbox.OpMove
+		if !move {
+			op = dropbox.OpCopy
+		}
+		relocFor := func(i int) dropbox.Relocation {
+			return dropbox.Relocation{
+				Op: op, From: entries[i].FromPath, To: entries[i].ToPath,
+				Name: path.Base(entries[i].FromPath), SourceID: entryIDs[i], SourceRev: entryRevs[i],
+			}
+		}
+		var single dropbox.Relocation
 		var fails []opFailure
 		if len(entries) == 1 {
+			single = relocFor(0)
+			if !move {
+				// Capture the destination before the write. Without this, a pre-existing file
+				// with the same content cannot be told apart from a copy that succeeded after a
+				// lost response, and would be reported as success.
+				if _, err := cl.GetMetadata(ctx, single.To); err == nil {
+					single.DestChecked, single.DestExisted = true, true
+				} else if dropbox.HasSummary(err, "not_found") {
+					single.DestChecked = true
+				} else {
+					fail(c, err)
+					return
+				}
+			}
 			if move {
 				err = cl.Move(ctx, entries[0].FromPath, entries[0].ToPath)
 			} else {
 				err = cl.Copy(ctx, entries[0].FromPath, entries[0].ToPath)
 			}
-			if err != nil {
-				fail(c, err)
-				return
-			}
 		} else {
-			var bf []dropbox.BatchFailure
+			var res dropbox.BatchResult
 			if move {
-				bf, err = cl.MoveBatch(ctx, entries)
+				res, err = cl.MoveBatchOutcome(ctx, entries)
 			} else {
-				bf, err = cl.CopyBatch(ctx, entries)
+				res, err = cl.CopyBatchOutcome(ctx, entries)
 			}
-			if err != nil {
-				fail(c, err)
-				return
-			}
-			for _, f := range bf {
-				fails = append(fails, opFailure{Path: vpaths[f.Index], Error: DropboxMessage(&dropbox.APIError{Summary: f.Summary})})
+			if err == nil {
+				for _, f := range res.Failures {
+					// Only a batch that was retried can report a done entry as a missing source or
+					// a destination conflict. In that case metadata that ties the destination to
+					// this entry may turn it into success; anything else stays an explicit unknown.
+					// A batch that was not retried returns definitive per-entry failures.
+					failure := opFailure{Path: vpaths[f.Index], Error: DropboxMessage(&dropbox.APIError{Summary: f.Summary})}
+					if res.Retried && relocationMayBeApplied(f.Summary) {
+						switch cl.ReconcileRelocation(ctx, relocFor(f.Index)) {
+						case dropbox.RelocationApplied:
+							continue
+						case dropbox.RelocationUnknown:
+							failure.Error = unknownWriteMessage(&dropbox.APIError{Summary: f.Summary})
+							failure.Unknown = true
+						}
+					}
+					fails = append(fails, failure)
+				}
+			} else if dropbox.WriteOutcomeUnknown(err) {
+				// The batch request itself may have been applied, but it returned no per-entry
+				// result to reconcile. Say unknown for every entry instead of a confirmed failure.
+				for i := range entries {
+					fails = append(fails, opFailure{Path: vpaths[i], Error: unknownWriteMessage(err), Unknown: true})
+				}
+				err = nil
 			}
 		}
+		// Invalidate before judging the outcome, for the reason rename documents.
 		for _, e := range entries {
 			if move {
 				s.VFS.InvalidatePath(dt.Storage.ID, e.FromPath)
 			}
 			s.VFS.InvalidatePath(dt.Storage.ID, e.ToPath)
+		}
+		if err != nil {
+			if len(entries) != 1 || !dropbox.WriteOutcomeUnknown(err) {
+				fail(c, err)
+				return
+			}
+			switch cl.ReconcileRelocation(ctx, single) {
+			case dropbox.RelocationApplied:
+				// The destination carries the source identity or verified copy evidence.
+			case dropbox.RelocationFailed:
+				fail(c, err)
+				return
+			default:
+				failWriteUnknown(c, err)
+				return
+			}
 		}
 		c.JSON(200, gin.H{"ok": len(fails) == 0, "failures": fails, "done": len(entries) - len(fails)})
 	}
@@ -575,25 +697,44 @@ func (s *Server) delete(c *gin.Context) {
 		cl, err := s.St.Client(id)
 		if err != nil {
 			for _, p := range g.vpaths {
-				fails = append(fails, opFailure{p, err.Error()})
+				fails = append(fails, opFailure{Path: p, Error: err.Error()})
 			}
 			continue
 		}
 		if len(g.dbx) == 1 {
-			if err := cl.Delete(ctx, g.dbx[0]); err != nil {
-				fails = append(fails, opFailure{g.vpaths[0], errorText(err)})
-			} else {
+			err := cl.Delete(ctx, g.dbx[0])
+			switch {
+			case err == nil:
 				done++
+			case !dropbox.WriteOutcomeUnknown(err):
+				fails = append(fails, opFailure{Path: g.vpaths[0], Error: errorText(err)})
+			default:
+				// A lost response leaves the delete unknown. An absent entry confirms it; a
+				// present entry confirms it did not happen; a failed lookup stays unknown.
+				switch cl.ReconcileDelete(ctx, g.dbx[0]) {
+				case dropbox.RelocationApplied:
+					done++
+				case dropbox.RelocationFailed:
+					fails = append(fails, opFailure{Path: g.vpaths[0], Error: errorText(err)})
+				default:
+					fails = append(fails, opFailure{Path: g.vpaths[0], Error: unknownWriteMessage(err), Unknown: true})
+				}
 			}
 		} else {
 			bf, err := cl.DeleteBatch(ctx, g.dbx)
 			if err != nil {
+				unknown := dropbox.WriteOutcomeUnknown(err)
 				for _, p := range g.vpaths {
-					fails = append(fails, opFailure{p, errorText(err)})
+					failure := opFailure{Path: p, Error: errorText(err)}
+					if unknown {
+						failure.Error = unknownWriteMessage(err)
+						failure.Unknown = true
+					}
+					fails = append(fails, failure)
 				}
 			} else {
 				for _, f := range bf {
-					fails = append(fails, opFailure{g.vpaths[f.Index], DropboxMessage(&dropbox.APIError{Summary: f.Summary})})
+					fails = append(fails, opFailure{Path: g.vpaths[f.Index], Error: DropboxMessage(&dropbox.APIError{Summary: f.Summary})})
 				}
 				done += len(g.dbx) - len(bf)
 			}

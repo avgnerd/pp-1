@@ -119,7 +119,7 @@ func ApplyTx(ctx context.Context, d *sql.DB, p *Payload, opts ApplyOptions) erro
 			updatedAt = v
 		}
 		var authorizedAt int64
-		if v, ok := parseRFC3339(rec.AuthorizedAt); ok {
+		if v, ok := parseRFC3339Millis(rec.AuthorizedAt); ok {
 			authorizedAt = v
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO storages(

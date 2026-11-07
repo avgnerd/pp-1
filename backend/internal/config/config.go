@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -231,7 +232,56 @@ func (c *Config) PublicCallback() string {
 	return c.PublicURL + "/api/oauth/callback"
 }
 
-// SecureCookies reports whether cookies should carry the Secure flag.
+// SecureCookies reports whether the configured public URL already proves the deployment is served
+// over TLS.
 func (c *Config) SecureCookies() bool {
 	return strings.HasPrefix(c.PublicURL, "https://")
+}
+
+// SecureRequest reports whether the session cookie for r must carry the Secure flag. A configured
+// https public_url always counts, so a deployment behind a TLS terminator keeps the flag even when
+// the inner hop is plain HTTP. Otherwise the transport decides: a TLS listener is secure, and an
+// X-Forwarded-Proto of https counts only when the request arrived from a configured trusted proxy,
+// because any other client can set that header itself.
+func (c *Config) SecureRequest(r *http.Request) bool {
+	if c.SecureCookies() || r.TLS != nil {
+		return true
+	}
+	if !c.TrustedProxy(r.RemoteAddr) {
+		return false
+	}
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if i := strings.IndexByte(proto, ','); i >= 0 {
+		proto = proto[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
+}
+
+// TrustedProxy reports whether remoteAddr is one of the configured trusted proxies, given as an IP
+// address or a CIDR block.
+func (c *Config) TrustedProxy(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	if ip == nil {
+		return false
+	}
+	for _, entry := range c.TrustedProxies {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if _, block, err := net.ParseCIDR(entry); err == nil && block.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if allowed := net.ParseIP(entry); allowed != nil && allowed.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }

@@ -542,12 +542,18 @@ func (a *Account) relocate(from, to string, move bool) {
 	src := a.nodes[from]
 	cp := *src
 	cp.Name = path.Base(to)
-	cp.ID = "id:" + toKey
+	// Dropbox keeps the stable id on a move and assigns a new one on a copy. The id is what a
+	// retried move can be reconciled against, so the fake must model that distinction.
+	if !move {
+		cp.ID = "id:" + toKey
+	}
 	a.nodes[toKey] = &cp
 	for _, k := range a.children(from, true) {
 		n := *a.nodes[k]
 		nk := toKey + k[len(from):]
-		n.ID = "id:" + nk
+		if !move {
+			n.ID = "id:" + nk
+		}
 		a.nodes[nk] = &n
 	}
 	if move {

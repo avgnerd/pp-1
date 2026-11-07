@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -206,9 +207,15 @@ func (c *Client) Copy(ctx context.Context, from, to string) error {
 	return c.RPC(ctx, "files/copy_v2", map[string]any{"from_path": from, "to_path": to, "autorename": false}, nil)
 }
 
-// Delete deletes a single entry.
+// Delete deletes a single entry. A path that is already gone is success: Dropbox documents
+// path_lookup/not_found as "it no longer exists", which is what a retried delete sees after the
+// first attempt removed it and its response was lost.
 func (c *Client) Delete(ctx context.Context, path string) error {
-	return c.RPC(ctx, "files/delete_v2", map[string]string{"path": path}, nil)
+	err := c.RPC(ctx, "files/delete_v2", map[string]string{"path": path}, nil)
+	if HasSummary(err, "not_found") {
+		return nil
+	}
+	return err
 }
 
 // BatchFailure describes a failed entry in a batch job.
@@ -226,46 +233,203 @@ type batchLaunch struct {
 	} `json:"entries"`
 }
 
+// BatchResult is the per-entry result of a batch call and whether an earlier attempt of that same
+// call was ambiguous. A failure summary is definitive only when Retried is false.
+type BatchResult struct {
+	Failures []BatchFailure
+	Retried  bool
+}
+
 // MoveBatch moves entries and waits for the async job.
 func (c *Client) MoveBatch(ctx context.Context, entries []RelocationEntry) ([]BatchFailure, error) {
-	return c.runBatch(ctx, "files/move_batch_v2", "files/move_batch/check_v2",
+	res, err := c.MoveBatchOutcome(ctx, entries)
+	return res.Failures, err
+}
+
+// MoveBatchOutcome is MoveBatch with the retry ambiguity a caller needs to judge per-entry failures.
+func (c *Client) MoveBatchOutcome(ctx context.Context, entries []RelocationEntry) (BatchResult, error) {
+	bf, retried, err := c.runBatch(ctx, "files/move_batch_v2", "files/move_batch/check_v2",
 		map[string]any{"entries": entries, "autorename": false})
+	return BatchResult{Failures: bf, Retried: retried}, err
 }
 
 // CopyBatch copies entries and waits for the async job.
 func (c *Client) CopyBatch(ctx context.Context, entries []RelocationEntry) ([]BatchFailure, error) {
-	return c.runBatch(ctx, "files/copy_batch_v2", "files/copy_batch/check_v2",
-		map[string]any{"entries": entries, "autorename": false})
+	res, err := c.CopyBatchOutcome(ctx, entries)
+	return res.Failures, err
 }
 
-// DeleteBatch deletes paths and waits for the async job.
+// CopyBatchOutcome is CopyBatch with the retry ambiguity a caller needs to judge per-entry failures.
+func (c *Client) CopyBatchOutcome(ctx context.Context, entries []RelocationEntry) (BatchResult, error) {
+	bf, retried, err := c.runBatch(ctx, "files/copy_batch_v2", "files/copy_batch/check_v2",
+		map[string]any{"entries": entries, "autorename": false})
+	return BatchResult{Failures: bf, Retried: retried}, err
+}
+
+// DeleteBatch deletes paths and waits for the async job. An entry that is already gone is not a
+// failure, for the same reason single Delete treats path_lookup/not_found as success.
 func (c *Client) DeleteBatch(ctx context.Context, paths []string) ([]BatchFailure, error) {
 	es := make([]map[string]string, len(paths))
 	for i, p := range paths {
 		es[i] = map[string]string{"path": p}
 	}
-	return c.runBatch(ctx, "files/delete_batch", "files/delete_batch/check", map[string]any{"entries": es})
-}
-
-func (c *Client) runBatch(ctx context.Context, launch, check string, arg any) ([]BatchFailure, error) {
-	var l batchLaunch
-	if err := c.RPC(ctx, launch, arg, &l); err != nil {
+	bf, _, err := c.runBatch(ctx, "files/delete_batch", "files/delete_batch/check", map[string]any{"entries": es})
+	if err != nil {
 		return nil, err
 	}
+	kept := bf[:0]
+	for _, f := range bf {
+		if strings.Contains(f.Summary, "not_found") {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return kept, nil
+}
+
+// Op names one non-idempotent relocation.
+type Op int
+
+const (
+	OpMove Op = iota
+	OpCopy
+)
+
+// Relocation describes one intended move or copy and the state observed before it was attempted.
+// A failure with an unknown outcome is reconciled from this evidence, never from "the source is
+// gone" or "a file with the same name and content exists".
+type Relocation struct {
+	Op          Op
+	From        string
+	To          string
+	Name        string
+	SourceID    string // source id observed before the write; a move keeps it
+	SourceRev   string // source revision observed before the write
+	DestChecked bool   // the destination was inspected before the write
+	DestExisted bool   // and it already existed, so a copy can only be a conflict
+}
+
+// RelocationOutcome is the evidence-based verdict for a failed relocation.
+type RelocationOutcome int
+
+const (
+	// RelocationFailed means the requested change is known not to have happened.
+	RelocationFailed RelocationOutcome = iota
+	// RelocationApplied means the destination carries evidence that ties it to this write.
+	RelocationApplied
+	// RelocationUnknown means the available metadata cannot settle the outcome. Callers must say
+	// so explicitly and invalidate cached listings; they must not call it success.
+	RelocationUnknown
+)
+
+// ReconcileRelocation decides a move or copy that failed ambiguously. Move success requires the
+// destination's stable id to equal the source id observed before the write; source disappearance
+// alone proves nothing. Copy success requires the destination to have been absent before the write
+// and to carry the source's unchanged content now, because an existing same-content file returns
+// the same conflict a retried copy does. Every other case is unknown rather than success.
+func (c *Client) ReconcileRelocation(ctx context.Context, r Relocation) RelocationOutcome {
+	dst, err := c.GetMetadata(ctx, r.To)
+	dstFound := err == nil
+	if err != nil && !HasSummary(err, "not_found") {
+		return RelocationUnknown
+	}
+	if r.Op == OpMove {
+		return c.reconcileMove(ctx, r, dst, dstFound)
+	}
+	return c.reconcileCopy(ctx, r, dst, dstFound)
+}
+
+func (c *Client) reconcileMove(ctx context.Context, r Relocation, dst *Metadata, dstFound bool) RelocationOutcome {
+	if r.SourceID == "" {
+		return RelocationUnknown // no pre-move identity to compare the destination with
+	}
+	if dstFound && dst.ID == r.SourceID && (r.Name == "" || strings.EqualFold(dst.Name, r.Name)) {
+		return RelocationApplied
+	}
+	src, err := c.GetMetadata(ctx, r.From)
+	if err == nil && src.ID == r.SourceID {
+		return RelocationFailed // the source still exists at its pre-move identity
+	}
+	// The source is gone, but the destination does not carry its id. It moved somewhere else, or
+	// the metadata is incomplete; only an explicit unknown is honest here.
+	return RelocationUnknown
+}
+
+func (c *Client) reconcileCopy(ctx context.Context, r Relocation, dst *Metadata, dstFound bool) RelocationOutcome {
+	if r.DestChecked && r.DestExisted {
+		return RelocationFailed // occupied before the write: a genuine conflict, not a copy
+	}
+	if !dstFound {
+		return RelocationFailed // no destination entry now, so this copy did not create one
+	}
+	if !r.DestChecked {
+		// Without pre-write destination evidence, an existing same-content file is
+		// indistinguishable from a completed copy. Never turn that into success.
+		return RelocationUnknown
+	}
+	if r.Name != "" && !strings.EqualFold(dst.Name, r.Name) {
+		return RelocationUnknown
+	}
+	src, err := c.GetMetadata(ctx, r.From)
+	if err != nil {
+		return RelocationUnknown
+	}
+	if r.SourceID != "" && src.ID != r.SourceID {
+		return RelocationUnknown
+	}
+	if r.SourceRev != "" && src.Rev != r.SourceRev {
+		return RelocationUnknown
+	}
+	if src.IsDir() != dst.IsDir() {
+		return RelocationUnknown
+	}
+	if src.IsDir() {
+		// A folder copy has no content hash tying the new entry to its source.
+		return RelocationUnknown
+	}
+	if src.ContentHash == "" || dst.ContentHash == "" {
+		return RelocationUnknown
+	}
+	if src.Size == dst.Size && src.ContentHash == dst.ContentHash {
+		return RelocationApplied
+	}
+	return RelocationUnknown
+}
+
+// ReconcileDelete decides a delete that failed ambiguously. The entry being gone is the outcome the
+// caller asked for; the entry still being present means the delete did not happen.
+func (c *Client) ReconcileDelete(ctx context.Context, path string) RelocationOutcome {
+	_, err := c.GetMetadata(ctx, path)
+	switch {
+	case err == nil:
+		return RelocationFailed
+	case HasSummary(err, "not_found"):
+		return RelocationApplied
+	default:
+		return RelocationUnknown
+	}
+}
+
+func (c *Client) runBatch(ctx context.Context, launch, check string, arg any) ([]BatchFailure, bool, error) {
+	ctx, marker := withRetryMarker(ctx)
+	var l batchLaunch
+	if err := c.RPC(ctx, launch, arg, &l); err != nil {
+		return nil, marker.ambiguous.Load(), err
+	}
 	if l.Tag == "complete" {
-		return failures(l), nil
+		return failures(l), marker.ambiguous.Load(), nil
 	}
 	if l.AsyncJobID == "" {
-		return nil, fmt.Errorf("%s: unexpected response tag %q", launch, l.Tag)
+		return nil, marker.ambiguous.Load(), fmt.Errorf("%s: unexpected response tag %q", launch, l.Tag)
 	}
 	wait := 300 * time.Millisecond
 	for {
 		if err := sleep(ctx, wait); err != nil {
-			return nil, err
+			return nil, marker.ambiguous.Load(), err
 		}
 		var st batchLaunch
 		if err := c.RPC(ctx, check, map[string]string{"async_job_id": l.AsyncJobID}, &st); err != nil {
-			return nil, err
+			return nil, marker.ambiguous.Load(), err
 		}
 		switch st.Tag {
 		case "in_progress":
@@ -274,9 +438,9 @@ func (c *Client) runBatch(ctx context.Context, launch, check string, arg any) ([
 			}
 			continue
 		case "complete":
-			return failures(st), nil
+			return failures(st), marker.ambiguous.Load(), nil
 		default:
-			return nil, fmt.Errorf("%s: job ended with %q", check, st.Tag)
+			return nil, marker.ambiguous.Load(), fmt.Errorf("%s: job ended with %q", check, st.Tag)
 		}
 	}
 }

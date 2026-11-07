@@ -283,7 +283,7 @@ func (s *Server) requireSession(c *gin.Context) {
 func (s *Server) setSessionCookie(c *gin.Context, tok string, maxAge int) {
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name: auth.CookieName, Value: tok, Path: "/", MaxAge: maxAge,
-		HttpOnly: true, Secure: s.Cfg.SecureCookies(), SameSite: http.SameSiteStrictMode,
+		HttpOnly: true, Secure: s.Cfg.SecureRequest(c.Request), SameSite: http.SameSiteStrictMode,
 	})
 }
 
@@ -444,7 +444,7 @@ func (s *Server) baseURL(c *gin.Context) string {
 	scheme := "http"
 	if c.Request.TLS != nil {
 		scheme = "https"
-	} else if len(s.Cfg.TrustedProxies) > 0 {
+	} else if s.Cfg.TrustedProxy(c.Request.RemoteAddr) {
 		if p := c.GetHeader("X-Forwarded-Proto"); p == "https" {
 			scheme = "https"
 		}

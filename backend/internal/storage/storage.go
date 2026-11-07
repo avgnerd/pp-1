@@ -132,6 +132,13 @@ type Manager struct {
 	// the restored row. Guarded by mu.
 	clientGeneration uint64
 
+	// authRevision is the in-process revision of each row's authorization state. A completion
+	// captures it before the token exchange, increments it when it activates the row, and a
+	// failure writes only while it is unchanged. That distinguishes two completions that write
+	// the same authorized_at millisecond, which a timestamp-only condition cannot. Guarded by
+	// stateMu, the same boundary the success write uses.
+	authRevision map[int64]uint64
+
 	// clientBuiltHook, when set, runs after a client has been built but before it is published to
 	// the cache. Tests use it to hold the publication across a restore or a completion; production
 	// leaves it nil.
@@ -141,7 +148,8 @@ type Manager struct {
 // NewManager loads all storages.
 func NewManager(db *sql.DB, box *secret.Box, cfg *config.Config) (*Manager, error) {
 	m := &Manager{db: db, box: box, cfg: cfg, now: time.Now, clients: map[int64]*dropbox.Client{},
-		ep: dropbox.Endpoints{API: cfg.DropboxAPIBase, Content: cfg.DropboxContentBase, Authorize: cfg.DropboxAuthorize, Token: cfg.DropboxTokenURL}}
+		authRevision: map[int64]uint64{},
+		ep:           dropbox.Endpoints{API: cfg.DropboxAPIBase, Content: cfg.DropboxContentBase, Authorize: cfg.DropboxAuthorize, Token: cfg.DropboxTokenURL}}
 	return m, m.reload()
 }
 
@@ -241,6 +249,14 @@ func (m *Manager) ResetAndInitClients() ([]string, error) {
 // runtime; the caller must already own the restore gate. A callback from a client built before
 // this point is ignored, even if it arrives after the gate is released.
 func (m *Manager) InvalidateClients() {
+	// A restore replaces every row, so an attempt that captured the pre-restore state must not
+	// write a failure afterwards. Moving each revision makes that old attempt stale even when the
+	// restored row happens to carry the same authorized_at millisecond.
+	m.stateMu.Lock()
+	for id := range m.authRevision {
+		m.authRevision[id]++
+	}
+	m.stateMu.Unlock()
 	m.mu.Lock()
 	m.clients = map[int64]*dropbox.Client{}
 	m.clientGeneration++
@@ -664,22 +680,89 @@ func ParsePastedURL(raw string) (code, state string, err error) {
 	return code, state, nil
 }
 
-func (m *Manager) complete(ctx context.Context, id int64, code, redirect string) (Storage, error) {
+// authAttempt is the row state one authorization completion started from. revision orders
+// completions in this process; authorizedAt and tokenEnc bind the attempt to the database row it
+// observed, so a late failure cannot match a row that a different completion replaced.
+type authAttempt struct {
+	revision     uint64
+	authorizedAt int64
+	tokenEnc     []byte
+}
+
+var errStaleAuthCompletion = errors.New("다른 인증 완료가 먼저 반영되었습니다. 저장소 상태를 새로고침하세요")
+
+// beginAuthAttempt snapshots the completion's starting state under the state boundary. The token
+// exchange and account lookup run outside it; only the snapshot and the final replacement need to
+// be ordered against other completions and client builds.
+func (m *Manager) beginAuthAttempt(id int64) (Storage, []byte, authAttempt, error) {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
 	s, ok := m.Get(id)
 	if !ok {
-		return Storage{}, errors.New("저장소를 찾을 수 없습니다")
+		return Storage{}, nil, authAttempt{}, errors.New("저장소를 찾을 수 없습니다")
 	}
-	var secEnc []byte
-	if err := m.db.QueryRow(`SELECT app_secret_enc FROM storages WHERE id = ?`, id).Scan(&secEnc); err != nil {
+	var appSecretEnc, tokenEnc []byte
+	if err := m.db.QueryRow(`SELECT app_secret_enc, refresh_token_enc FROM storages WHERE id = ?`, id).
+		Scan(&appSecretEnc, &tokenEnc); err != nil {
+		return Storage{}, nil, authAttempt{}, err
+	}
+	return s, appSecretEnc, authAttempt{
+		revision:     m.authRevision[id],
+		authorizedAt: s.AuthorizedAt,
+		tokenEnc:     tokenEnc,
+	}, nil
+}
+
+// finishAuthAttempt replaces the credential only while the row is still the state the attempt
+// started from. The revision check and the write happen under the same state boundary, so a
+// completion that lands first makes this one stale even when both write the same millisecond.
+// The SQL condition repeats the observed authorized_at and credential ciphertext, so a row
+// replaced outside complete (for example by a restore) cannot be overwritten by an older attempt.
+func (m *Manager) finishAuthAttempt(id int64, attempt authAttempt, rtEnc []byte, acct *dropbox.Account) error {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	if m.authRevision[id] != attempt.revision {
+		return errStaleAuthCompletion
+	}
+	now := m.now()
+	query := `UPDATE storages SET refresh_token_enc = ?, account_id = ?, account_email = ?, account_name = ?, status = ?, last_error = '', updated_at = ?, authorized_at = ? WHERE id = ? AND authorized_at = ?`
+	args := []any{rtEnc, acct.AccountID, acct.Email, acct.Name.DisplayName, StatusActive, now.Unix(), now.UnixMilli(), id, attempt.authorizedAt}
+	if attempt.tokenEnc == nil {
+		query += ` AND refresh_token_enc IS NULL`
+	} else {
+		query += ` AND refresh_token_enc = ?`
+		args = append(args, attempt.tokenEnc)
+	}
+	res, err := m.db.Exec(query, args...)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errStaleAuthCompletion
+	}
+	m.authRevision[id] = m.authRevision[id] + 1
+	m.mu.Lock()
+	delete(m.clients, id)
+	m.mu.Unlock()
+	return m.reload()
+}
+
+func (m *Manager) complete(ctx context.Context, id int64, code, redirect string) (Storage, error) {
+	s, appSecretEnc, attempt, err := m.beginAuthAttempt(id)
+	if err != nil {
 		return Storage{}, err
 	}
-	appSecret, err := m.box.Open(secEnc)
+	appSecret, err := m.box.Open(appSecretEnc)
 	if err != nil {
 		return Storage{}, err
 	}
 	tok, err := dropbox.ExchangeCode(ctx, nil, m.ep, s.AppKey, string(appSecret), strings.TrimSpace(code), redirect)
 	if err != nil {
-		m.setError(id, "토큰 교환 실패: "+err.Error())
+		m.setError(id, attempt, "토큰 교환 실패: "+err.Error())
 		return Storage{}, fmt.Errorf("Dropbox 토큰 교환에 실패했습니다: %w", err)
 	}
 	if tok.RefreshToken == "" {
@@ -688,7 +771,7 @@ func (m *Manager) complete(ctx context.Context, id int64, code, redirect string)
 	c := dropbox.New(m.ep, s.AppKey, string(appSecret), tok.RefreshToken)
 	acct, err := c.CurrentAccount(ctx)
 	if err != nil {
-		m.setError(id, "계정 정보 조회 실패: "+err.Error())
+		m.setError(id, attempt, "계정 정보 조회 실패: "+err.Error())
 		return Storage{}, fmt.Errorf("계정 정보를 읽지 못했습니다(account_info.read 권한을 확인하세요): %w", err)
 	}
 	rtEnc, err := m.box.Seal([]byte(tok.RefreshToken))
@@ -698,18 +781,7 @@ func (m *Manager) complete(ctx context.Context, id int64, code, redirect string)
 	// The token write and the cache invalidation are one state replacement. Client builds under
 	// the same boundary, so a client that read the old token cannot be published after this write,
 	// and a stale reauth callback rechecks its identity under it before touching the status.
-	if err := func() error {
-		m.stateMu.Lock()
-		defer m.stateMu.Unlock()
-		if _, err := m.db.Exec(`UPDATE storages SET refresh_token_enc = ?, account_id = ?, account_email = ?, account_name = ?, status = ?, last_error = '', updated_at = ?, authorized_at = ? WHERE id = ?`,
-			rtEnc, acct.AccountID, acct.Email, acct.Name.DisplayName, StatusActive, m.now().Unix(), m.now().UnixMilli(), id); err != nil {
-			return err
-		}
-		m.mu.Lock()
-		delete(m.clients, id)
-		m.mu.Unlock()
-		return m.reload()
-	}(); err != nil {
+	if err := m.finishAuthAttempt(id, attempt, rtEnc, acct); err != nil {
 		return Storage{}, err
 	}
 	m.changed(id)
@@ -717,8 +789,33 @@ func (m *Manager) complete(ctx context.Context, id int64, code, redirect string)
 	return s, nil
 }
 
-func (m *Manager) setError(id int64, msg string) {
-	_, _ = m.db.Exec(`UPDATE storages SET last_error = ?, updated_at = ? WHERE id = ?`, msg, m.now().Unix(), id)
+// setError records a failed authorization attempt against the row state the attempt started
+// from. The state boundary serializes it with every success write. A revision change means a
+// newer completion activated the row, so the late failure writes nothing; when no newer
+// completion landed, the same conditional write keeps a legitimate failure visible. The
+// authorized_at and ciphertext conditions add the database identity of that state, so an attempt
+// from before a restore cannot match the restored row.
+func (m *Manager) setError(id int64, attempt authAttempt, msg string) {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	if m.authRevision[id] != attempt.revision {
+		return
+	}
+	query := `UPDATE storages SET last_error = ?, updated_at = ? WHERE id = ? AND authorized_at = ?`
+	args := []any{msg, m.now().Unix(), id, attempt.authorizedAt}
+	if attempt.tokenEnc == nil {
+		query += ` AND refresh_token_enc IS NULL`
+	} else {
+		query += ` AND refresh_token_enc = ?`
+		args = append(args, attempt.tokenEnc)
+	}
+	res, err := m.db.Exec(query, args...)
+	if err != nil {
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return
+	}
 	_ = m.reload()
 }
 

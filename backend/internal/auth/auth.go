@@ -28,7 +28,8 @@ const (
 	CSRFValue       = "dvfs"
 )
 
-// Argon2id parameters (64 MiB, 3 passes, 2 lanes).
+// Argon2id parameters for newly written hashes (64 MiB, 3 passes, 2 lanes). The existing low
+// memory value stays: changing it would force a rehash and alter login cost for no security gain.
 const (
 	argonTime    = 3
 	argonMemory  = 64 * 1024
@@ -38,10 +39,11 @@ const (
 
 // Bounds accepted when verifying a stored hash. The admin row can come from a restored backup, so
 // it is treated as untrusted input: without bounds one login can allocate gigabytes, burn CPU, or
-// panic inside the argon2 KDF. The memory ceiling matches the backup KDF ceiling. The argon2
-// memory minimum stays at the legacy validator's 8 KiB because low memory is not a resource risk.
-// Bcrypt is capped at cost 14 for both login and restore validation; a cost 15..31 hash is
-// rejected before any KDF runs.
+// panic inside the argon2 KDF. The memory ceiling stays at the historical 256 MiB so a backup
+// written by an earlier build keeps working; lowering it would reject hashes this product itself
+// accepted. The argon2 memory minimum stays at the legacy validator's 8 KiB because low memory is
+// not a resource risk. Bcrypt is capped at cost 14 for both login and restore validation; a cost
+// 15..31 hash is rejected before any KDF runs.
 const (
 	maxPasswordHashLen = 512
 	minArgonMemoryKiB  = 8
@@ -55,6 +57,24 @@ const (
 	maxBcryptCost      = 14
 )
 
+// kdfConcurrency is one, not a number tuned to a heap measurement. With the 256 MiB ceiling, one
+// process-wide slot makes the KDF memory bound 256 MiB by construction, however many logins
+// arrive; a larger slot count would multiply that ceiling. Bcrypt cost 14 also takes the slot, so
+// a burst cannot stack CPU-bound hashes around Argon2 either. This is deliberately conservative:
+// a caller beyond the budget waits for a slot, and a hash rejected by the policy bounds above
+// never takes one because validation finishes before the KDF starts.
+const kdfConcurrency = 1
+
+var kdfSlots = make(chan struct{}, kdfConcurrency)
+
+// runKDF runs one password KDF inside the admission limit. The deferred release returns the slot
+// on every exit path, including a panic from the KDF.
+func runKDF(fn func()) {
+	kdfSlots <- struct{}{}
+	defer func() { <-kdfSlots }()
+	fn()
+}
+
 var (
 	ErrInvalidCredentials = errors.New("이름 또는 비밀번호가 올바르지 않습니다")
 	ErrLocked             = errors.New("로그인 실패가 너무 많습니다. 15분 후 다시 시도하세요")
@@ -67,7 +87,8 @@ func HashPassword(pw string) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	h := argon2.IDKey([]byte(pw), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	var h []byte
+	runKDF(func() { h = argon2.IDKey([]byte(pw), salt, argonTime, argonMemory, argonThreads, argonKeyLen) })
 	return fmt.Sprintf("$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s", argonMemory, argonTime, argonThreads,
 		base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(h)), nil
 }
@@ -85,14 +106,20 @@ func VerifyPassword(encoded, pw string) bool {
 		if cost > maxBcryptCost {
 			return false
 		}
-		return bcrypt.CompareHashAndPassword([]byte(encoded), []byte(pw)) == nil
+		ok := false
+		runKDF(func() { ok = bcrypt.CompareHashAndPassword([]byte(encoded), []byte(pw)) == nil })
+		return ok
 	}
 	p, ok := parseArgon2PHC(encoded)
 	if !ok {
 		return false
 	}
-	got := argon2.IDKey([]byte(pw), p.salt, p.time, p.memory, p.threads, uint32(len(p.key)))
-	return subtle.ConstantTimeCompare(got, p.key) == 1
+	ok = false
+	runKDF(func() {
+		got := argon2.IDKey([]byte(pw), p.salt, p.time, p.memory, p.threads, uint32(len(p.key)))
+		ok = subtle.ConstantTimeCompare(got, p.key) == 1
+	})
+	return ok
 }
 
 // ValidatePasswordHash reports whether encoded is a hash this build can verify. Backup restore
