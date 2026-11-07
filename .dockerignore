@@ -1,0 +1,14 @@
+.git
+.agents
+.playwright-cli
+.playwright-mcp
+data
+data-*
+tools
+bin
+frontend/node_modules
+frontend/dist
+frontend/test-results
+frontend/playwright-report
+backend/internal/web/dist/*
+!backend/internal/web/dist/.keep

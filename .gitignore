@@ -1,0 +1,20 @@
+# runtime data and downloaded tools
+/data/
+/data-*/
+/tools/
+/bin/
+
+# frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/test-results/
+/frontend/playwright-report/
+
+# embedded build output (copied from frontend/dist)
+/backend/internal/web/dist/*
+!/backend/internal/web/dist/.keep
+
+# agent tooling
+/.playwright-cli/
+/.playwright-mcp/
+/data-playwright/
