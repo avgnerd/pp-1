@@ -366,6 +366,8 @@ func fail(c *gin.Context, err error) {
 		c.JSON(404, gin.H{"error": "파일이나 폴더를 찾을 수 없습니다. 이동되었거나 삭제되었을 수 있습니다"})
 	case errors.Is(err, storage.ErrState):
 		c.JSON(400, gin.H{"error": err.Error()})
+	case errors.Is(err, storage.ErrRestoreInProgress):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "restore_in_progress"})
 	case errors.Is(err, dropbox.ErrReauth):
 		c.JSON(409, gin.H{"error": err.Error(), "code": "reauth"})
 	case errors.Is(err, media.ErrBusy):

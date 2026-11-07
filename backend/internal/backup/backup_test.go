@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -553,6 +554,61 @@ func TestValidatePayloadAcceptsBcryptHash(t *testing.T) {
 	p.Admin.PasswordHash = string(h)
 	if err := ValidatePayload(p); err != nil {
 		t.Fatalf("bcrypt hash rejected: %v", err)
+	}
+}
+
+// TestValidatePayloadBcryptCostBoundary pins the same cap as login: cost 4..14 is accepted and
+// cost 15..31 is rejected before any KDF runs. Only the cost field of a valid hash changes.
+func TestValidatePayloadBcryptCostBoundary(t *testing.T) {
+	base, err := bcrypt.GenerateFromPassword([]byte("restored-password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.SplitN(string(base), "$", 4)
+	if len(parts) != 4 {
+		t.Fatalf("test bcrypt hash has an unexpected shape: %q", base)
+	}
+	for _, cost := range []int{4, 10, 14} {
+		parts[2] = fmt.Sprintf("%02d", cost)
+		p := validPayload(t)
+		p.Admin.PasswordHash = strings.Join(parts, "$")
+		if err := ValidatePayload(p); err != nil {
+			t.Errorf("bcrypt cost %d rejected: %v", cost, err)
+		}
+	}
+	for _, cost := range []int{15, 31} {
+		parts[2] = fmt.Sprintf("%02d", cost)
+		p := validPayload(t)
+		p.Admin.PasswordHash = strings.Join(parts, "$")
+		err := ValidatePayload(p)
+		var ve *ValidationError
+		if !errors.As(err, &ve) || !strings.Contains(ve.Msg, "password_hash") {
+			t.Errorf("bcrypt cost %d: err = %v, want a password_hash validation error", cost, err)
+		}
+	}
+}
+
+// TestValidatePayloadRejectsHostilePasswordHashParameters keeps a restored instance from accepting
+// an argon2 hash whose verification would exhaust memory or a worker thread. Bcrypt is covered by
+// the legacy compatibility test above; its high-cost CPU is a documented user-selected constraint.
+func TestValidatePayloadRejectsHostilePasswordHashParameters(t *testing.T) {
+	salt := base64.RawStdEncoding.EncodeToString(make([]byte, 16))
+	sum := base64.RawStdEncoding.EncodeToString(make([]byte, 32))
+	cases := []struct{ name, hash string }{
+		{"argon2 memory 2 GiB", "$argon2id$v=19$m=2097152,t=3,p=2$" + salt + "$" + sum},
+		{"argon2 time 32", "$argon2id$v=19$m=65536,t=32,p=2$" + salt + "$" + sum},
+		{"argon2 threads 64", "$argon2id$v=19$m=65536,t=3,p=64$" + salt + "$" + sum},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := validPayload(t)
+			p.Admin.PasswordHash = c.hash
+			err := ValidatePayload(p)
+			var ve *ValidationError
+			if !errors.As(err, &ve) || !strings.Contains(ve.Msg, "password_hash") {
+				t.Fatalf("err = %v, want a password_hash validation error", err)
+			}
+		})
 	}
 }
 

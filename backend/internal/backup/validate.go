@@ -1,13 +1,11 @@
 package backup
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
 
-	"golang.org/x/crypto/bcrypt"
-
+	"github.com/dvfs/dropbox-vfs-manager/internal/auth"
 	"github.com/dvfs/dropbox-vfs-manager/internal/pathutil"
 	"github.com/dvfs/dropbox-vfs-manager/internal/settings"
 	"github.com/dvfs/dropbox-vfs-manager/internal/storage"
@@ -112,42 +110,12 @@ func storageLabel(rec StorageRecord) string {
 	return fmt.Sprintf("#%d", rec.ID)
 }
 
-// validatePasswordHash accepts the hashes this app can verify: the argon2id PHC string
-// auth.HashPassword writes, or bcrypt for a backup produced by a build that used it. A random
-// string is rejected so a damaged file cannot silently lock the admin out of the instance.
+// validatePasswordHash accepts only a hash this build can verify within the login policy. The
+// same validation runs at login, so a backup cannot install parameters that would make every
+// later login exhaust memory, burn CPU or panic inside the KDF.
 func validatePasswordHash(h string) error {
-	if _, err := bcrypt.Cost([]byte(h)); err == nil {
-		return nil
-	}
-	if validateArgon2PHC(h) == nil {
-		return nil
-	}
-	return errors.New("비밀번호 해시 형식을 알 수 없습니다")
-}
-
-var errNotArgon2 = errors.New("not an argon2id hash")
-
-// validateArgon2PHC checks the shape of an argon2id PHC string without running the KDF.
-func validateArgon2PHC(h string) error {
-	parts := strings.Split(h, "$")
-	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || !strings.HasPrefix(parts[2], "v=") {
-		return errNotArgon2
-	}
-	var m, t uint32
-	var p uint8
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &m, &t, &p); err != nil {
-		return errNotArgon2
-	}
-	if m < 8 || m > 1<<21 || t < 1 || t > 32 || p < 1 || p > 64 {
-		return errNotArgon2
-	}
-	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
-	if err != nil || len(salt) < 8 {
-		return errNotArgon2
-	}
-	sum, err := base64.RawStdEncoding.DecodeString(parts[5])
-	if err != nil || len(sum) < 16 {
-		return errNotArgon2
+	if err := auth.ValidatePasswordHash(h); err != nil {
+		return errors.New("비밀번호 해시 형식을 알 수 없습니다")
 	}
 	return nil
 }

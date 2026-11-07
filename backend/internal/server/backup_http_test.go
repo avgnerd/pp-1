@@ -23,6 +23,7 @@ import (
 	"github.com/dvfs/dropbox-vfs-manager/internal/backup"
 	"github.com/dvfs/dropbox-vfs-manager/internal/media"
 	"github.com/dvfs/dropbox-vfs-manager/internal/settings"
+	"github.com/dvfs/dropbox-vfs-manager/internal/storage"
 )
 
 // ---- helpers ----
@@ -646,6 +647,95 @@ func TestRestoreApplyConflictsWhenOneIsRunning(t *testing.T) {
 	}
 }
 
+// TestStorageMutationsRejectedWhileRestoreRuns requires a storage mutation that arrives during a
+// restore to fail fast instead of writing a row the restore transaction or runtime refresh can
+// overwrite.
+func TestStorageMutationsRejectedWhileRestoreRuns(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	_, raw, _ := e.exportBackup(e.c, map[string]any{"encrypted": false, "confirm_unencrypted": true})
+	preview := e.previewOne(e.c, raw, "")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	e.srv.restoreHook = func() {
+		startOnce.Do(func() { close(started) })
+		<-release
+	}
+	defer func() { e.srv.restoreHook = nil }()
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+
+	done := make(chan int, 1)
+	go func() {
+		status, _ := e.postJSON(e.c, "/api/admin/restore/apply", map[string]string{"preview_id": preview.PreviewID}, nil)
+		done <- status
+	}()
+	<-started
+
+	status, body := e.postJSON(e.c, "/api/admin/storages", map[string]any{
+		"name": "intruder", "mount_path": "/intruder", "app_key": "k", "app_secret": "s",
+	}, nil)
+	unblock()
+	applyStatus := <-done
+	if status != http.StatusConflict {
+		t.Fatalf("storage create during restore = %d, want 409: %s", status, truncate(body))
+	}
+	if applyStatus != http.StatusOK {
+		t.Fatalf("restore finished with %d", applyStatus)
+	}
+}
+
+// TestRestoreGateReleasedAfterFailure requires a restore that never reaches the transaction to
+// hand the storage mutation gate back, so the admin can keep editing storages.
+func TestRestoreGateReleasedAfterFailure(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	status, body := e.postJSON(e.c, "/api/admin/restore/apply", map[string]string{"preview_id": "unknown"}, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("unknown preview apply = %d: %s", status, truncate(body))
+	}
+	status, body = e.postJSON(e.c, "/api/admin/storages", map[string]any{
+		"name": "after-failure", "mount_path": "/after-failure", "app_key": "k", "app_secret": "s",
+	}, nil)
+	if status != http.StatusCreated {
+		t.Fatalf("storage create after failed restore = %d: %s", status, truncate(body))
+	}
+}
+
+// TestRestoreAuthLockReleasedAfterApplyFailure makes the restore transaction fail after the
+// credential lock is taken. The lock and the storage gate must both be released, so a login and a
+// storage edit still work afterwards.
+func TestRestoreAuthLockReleasedAfterApplyFailure(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	_, raw, _ := e.exportBackup(e.c, map[string]any{"encrypted": false, "confirm_unencrypted": true})
+	preview := e.previewOne(e.c, raw, "")
+	if _, err := e.srv.DB.Exec(`CREATE TRIGGER fail_restore_admin BEFORE INSERT ON admin BEGIN SELECT RAISE(ABORT, 'restore failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	status, body := e.postJSON(e.c, "/api/admin/restore/apply", map[string]string{"preview_id": preview.PreviewID}, nil)
+	if status == http.StatusOK {
+		t.Fatalf("restore reported success although the transaction failed: %s", truncate(body))
+	}
+	if _, err := e.srv.DB.Exec(`DROP TRIGGER fail_restore_admin`); err != nil {
+		t.Fatal(err)
+	}
+
+	loginClient := e.newClient()
+	loginClient.Timeout = 5 * time.Second
+	if st := e.loginAs(loginClient, "admin", auth.DefaultPassword); st != http.StatusOK {
+		t.Fatalf("login after failed restore = %d", st)
+	}
+	status, body = e.postJSON(e.c, "/api/admin/storages", map[string]any{
+		"name": "after-rollback", "mount_path": "/after-rollback", "app_key": "k", "app_secret": "s",
+	}, nil)
+	if status != http.StatusCreated {
+		t.Fatalf("storage create after rolled-back restore = %d: %s", status, truncate(body))
+	}
+}
+
 // ---- 5. runtime refresh ----
 
 func TestRestoreRefreshesRuntimeState(t *testing.T) {
@@ -1082,5 +1172,44 @@ func TestBackupRefusesUnreadableCredentials(t *testing.T) {
 	}
 	if strings.Contains(body.Error, "00010203") {
 		t.Fatal("error leaks ciphertext")
+	}
+}
+
+// TestRestoreInvalidatesPreRestoreClientCallbacks runs the real apply path and then invokes the
+// reauth callback of a client obtained before the restore. The restored row and its fresh client
+// must survive: the callback belongs to the state the restore replaced.
+func TestRestoreInvalidatesPreRestoreClientCallbacks(t *testing.T) {
+	e := newEnv(t)
+	e.login()
+	id := e.connectNamed("app-key-old", "Main", "/main")
+	oldClient, err := e.srv.St.Client(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, raw, resp := e.exportBackup(e.c, map[string]any{"encrypted": false, "confirm_unencrypted": true})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("export status %d: %s", resp.StatusCode, truncate(raw))
+	}
+	e.previewAndApply(e.c, raw, "")
+
+	newClient, err := e.srv.St.Client(id)
+	if err != nil {
+		t.Fatalf("restored storage client: %v", err)
+	}
+	if newClient == oldClient {
+		t.Fatal("restore left the pre-restore client in the cache")
+	}
+
+	oldClient.OnReauthNeeded()
+
+	var status, lastError string
+	if err := e.srv.DB.QueryRow(`SELECT status, last_error FROM storages WHERE id = ?`, id).Scan(&status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != storage.StatusActive || lastError != "" {
+		t.Fatalf("stale callback changed the restored row to status %q, last_error %q", status, lastError)
+	}
+	if got, err := e.srv.St.Client(id); err != nil || got != newClient {
+		t.Fatalf("stale callback changed the restored client cache: got %p (err %v), want %p", got, err, newClient)
 	}
 }

@@ -122,6 +122,11 @@ func (s *Server) restoreApply(c *gin.Context) {
 		return
 	}
 	defer s.restoreMu.Unlock()
+	// Hold the storage mutation gate across the transaction and the runtime refresh, so a
+	// create/update/delete/OAuth completion either finishes before the restore starts or gets a
+	// conflict instead of writing a row the restore is replacing.
+	s.St.BeginRestore()
+	defer s.St.EndRestore()
 	if s.restoreHook != nil {
 		s.restoreHook()
 	}
@@ -134,6 +139,11 @@ func (s *Server) restoreApply(c *gin.Context) {
 		writeBackupError(c, err)
 		return
 	}
+	// Hold the credential lock across the admin/settings/storage replacement and the runtime
+	// refresh, so a profile change that verified the pre-restore admin row cannot write it back
+	// over the restored one.
+	s.Auth.BeginRestore()
+	defer s.Auth.EndRestore()
 	snapshot, err := s.Backups.Apply(c.Request.Context(), preview)
 	if err != nil {
 		s.logger.Audit("restore.apply", "outcome", "failure", "reason", auditReason(err),
@@ -141,6 +151,10 @@ func (s *Server) restoreApply(c *gin.Context) {
 		writeBackupError(c, err)
 		return
 	}
+	// The storage rows are the restored ones now. Invalidate pre-restore clients before the rest
+	// of the refresh, so a callback from one of them cannot write over a restored row even if a
+	// later refresh step fails.
+	s.St.InvalidateClients()
 	failed, err := s.refreshRuntime(c)
 	if err != nil {
 		s.logger.Audit("restore.apply", "outcome", "failure", "reason", "runtime_refresh_failed",
@@ -204,10 +218,15 @@ func (s *Server) previewSnapshot(c *gin.Context) {
 	c.JSON(http.StatusOK, preview)
 }
 
-// refreshRuntime publishes the restored state without a restart: settings in memory, caches, HLS
-// sessions, storage clients and login sessions, in that order. It returns the names of storages
-// whose Dropbox client could not be built; those are marked "error" and the restore stays valid.
+// refreshRuntime publishes the restored state without a restart: login sessions first, then
+// settings in memory, caches, HLS sessions and storage clients. Revoking sessions before the other
+// refreshes means a later refresh failure cannot leave a pre-restore cookie validating against the
+// replaced database. It returns the names of storages whose Dropbox client could not be built;
+// those are marked "error" and the restore stays valid.
 func (s *Server) refreshRuntime(c *gin.Context) ([]string, error) {
+	if err := s.Auth.RevokeAllSessionsDuringRestore(); err != nil {
+		return nil, err
+	}
 	restored, err := settings.ReadAll(s.DB)
 	if err != nil {
 		return nil, err
@@ -217,9 +236,6 @@ func (s *Server) refreshRuntime(c *gin.Context) ([]string, error) {
 	s.HLS.StopSessions()
 	failed, err := s.St.ResetAndInitClients()
 	if err != nil {
-		return nil, err
-	}
-	if err := s.Auth.RevokeAllSessions(); err != nil {
 		return nil, err
 	}
 	// The browser that asked for the restore holds a session that no longer exists.

@@ -102,10 +102,40 @@ type Manager struct {
 	onChange []func(id int64)
 	now      func() time.Time
 
+	// reloadMu serializes the database read and the publication that follows it. A snapshot may
+	// only overwrite the in-memory list in the same order its query ran, so a reload that started
+	// earlier can never publish older rows after a newer reload has published.
+	reloadMu sync.Mutex
+
 	// mountMu serializes the mount check with the row write that follows it. The UNIQUE index on
 	// mount_path compares bytes, so it cannot reject a case-only duplicate or a nested path; only
 	// holding this across checkMount and the write keeps two concurrent saves from both passing.
 	mountMu sync.Mutex
+
+	// mutationMu keeps a restore apply from interleaving with a storage mutation. A restore holds
+	// the write side for the transaction and the runtime refresh; each mutating method takes the
+	// read side, and fails fast when a restore owns the gate.
+	mutationMu sync.RWMutex
+
+	// stateMu is the ownership boundary for one storage row's credential/status state. complete
+	// takes it around the token write and the cache invalidation that belongs to it; a client
+	// build takes it around the row read and cache publication; and a reauth callback rechecks its
+	// client identity and generation under it before writing status. This makes "check, then
+	// write" one ownership step and keeps a client built from the old token from being published
+	// after the completion. Lock order: mutationMu -> stateMu -> reloadMu -> mu. No path takes
+	// stateMu while holding mu, reloadMu or mountMu, and no database query runs while mu is held.
+	stateMu sync.Mutex
+
+	// clientGeneration advances whenever a restore replaces the storage rows and invalidates every
+	// cached client. A client captures the generation it was built under; its reauth callback is
+	// ignored once the generation moves, so a failure from a pre-restore client cannot overwrite
+	// the restored row. Guarded by mu.
+	clientGeneration uint64
+
+	// clientBuiltHook, when set, runs after a client has been built but before it is published to
+	// the cache. Tests use it to hold the publication across a restore or a completion; production
+	// leaves it nil.
+	clientBuiltHook func()
 }
 
 // NewManager loads all storages.
@@ -137,6 +167,8 @@ func scan(r interface{ Scan(...any) error }) (*Storage, error) {
 }
 
 func (m *Manager) reload() error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
 	rows, err := m.db.Query(`SELECT ` + cols + ` FROM storages`)
 	if err != nil {
 		return err
@@ -157,6 +189,7 @@ func (m *Manager) reload() error {
 	}
 	sort.Slice(list, func(i, j int) bool { return strings.ToLower(list[i].MountPath) < strings.ToLower(list[j].MountPath) })
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.list = list
 	m.byID = byID
 	for id := range m.clients {
@@ -164,7 +197,6 @@ func (m *Manager) reload() error {
 			delete(m.clients, id)
 		}
 	}
-	m.mu.Unlock()
 	return nil
 }
 
@@ -184,9 +216,10 @@ func (m *Manager) All() []Storage {
 // client cannot be built is marked "error"; its name is returned in failedStorages and the
 // restore that called this carries on with the remaining storages.
 func (m *Manager) ResetAndInitClients() ([]string, error) {
-	m.mu.Lock()
-	m.clients = map[int64]*dropbox.Client{}
-	m.mu.Unlock()
+	// Advance the generation before the restored rows are published to the in-memory snapshot, so
+	// every client built from the replaced state is stale even if an in-flight request still holds
+	// it.
+	m.InvalidateClients()
 	if err := m.reload(); err != nil {
 		return nil, err
 	}
@@ -195,12 +228,23 @@ func (m *Manager) ResetAndInitClients() ([]string, error) {
 		if s.Status == StatusPending {
 			continue
 		}
-		if _, err := m.Client(s.ID); err != nil {
-			m.markError(s.ID, err.Error())
+		if _, err := m.clientOwned(s.ID); err != nil {
+			m.markErrorLocked(s.ID, err.Error(), m.now().Unix())
 			failed = append(failed, s.Name)
 		}
 	}
 	return failed, nil
+}
+
+// InvalidateClients drops every cached client and advances the client generation. A restore calls
+// it once the restored rows are committed and again from ResetAndInitClients while rebuilding the
+// runtime; the caller must already own the restore gate. A callback from a client built before
+// this point is ignored, even if it arrives after the gate is released.
+func (m *Manager) InvalidateClients() {
+	m.mu.Lock()
+	m.clients = map[int64]*dropbox.Client{}
+	m.clientGeneration++
+	m.mu.Unlock()
 }
 
 // Get returns a storage by id.
@@ -226,11 +270,50 @@ func (m *Manager) ByMount(vpath string) (Storage, bool) {
 	return Storage{}, false
 }
 
-// Client returns an API client for an active storage.
+// Client returns an API client for an active storage. It holds the mutation gate across the cache
+// lookup, the row read and the cache publication, so a restore cannot replace the row between
+// them. It also holds the state boundary, so a reauth completion cannot replace the token between
+// the build and its publication. A restore in progress fails fast instead of returning a client
+// built from the old row.
 func (m *Manager) Client(id int64) (*dropbox.Client, error) {
+	release, err := m.beginMutation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	c, err := m.buildClient(id)
+	if err != nil {
+		return nil, err
+	}
+	if m.clientBuiltHook != nil {
+		m.clientBuiltHook()
+	}
+	return m.cacheClient(id, c), nil
+}
+
+// clientOwned builds and caches a client for a caller that already holds the mutation gate. The
+// restore refresh and Delete's revoke use it; taking the gate again from Client would fail or wait
+// behind a restore that cannot start until the caller finishes.
+func (m *Manager) clientOwned(id int64) (*dropbox.Client, error) {
+	c, err := m.buildClient(id)
+	if err != nil {
+		return nil, err
+	}
+	return m.cacheClient(id, c), nil
+}
+
+// buildClient returns a cached client or builds one without publishing it. The caller must hold
+// the mutation gate, so a restore cannot replace the row between the snapshot read and the
+// callback assignment. A caller that can race a reauth completion, such as Client, must also hold
+// stateMu across the build and the publication; the restore refresh is serialized by the write
+// side of the mutation gate instead.
+func (m *Manager) buildClient(id int64) (*dropbox.Client, error) {
 	m.mu.RLock()
 	c, ok := m.clients[id]
 	s := m.byID[id]
+	generation := m.clientGeneration
 	m.mu.RUnlock()
 	if ok {
 		return c, nil
@@ -257,19 +340,72 @@ func (m *Manager) Client(id int64) (*dropbox.Client, error) {
 		return nil, fmt.Errorf("refresh token 복호화 실패: %w", err)
 	}
 	c = dropbox.New(m.ep, s.AppKey, string(appSecret), string(rt))
-	c.OnReauthNeeded = func() { m.markError(id, dropbox.ErrReauth.Error()) }
-	m.mu.Lock()
-	if existing, ok := m.clients[id]; ok {
-		c = existing
-	} else {
-		m.clients[id] = c
-	}
-	m.mu.Unlock()
+	c.OnReauthNeeded = func() { m.markErrorIfCurrent(id, generation, c, dropbox.ErrReauth.Error()) }
 	return c, nil
 }
 
-func (m *Manager) markError(id int64, msg string) {
-	_, _ = m.db.Exec(`UPDATE storages SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`, StatusError, msg, m.now().Unix(), id)
+// cacheClient publishes a built client and returns the one that won a concurrent insert.
+func (m *Manager) cacheClient(id int64, c *dropbox.Client) *dropbox.Client {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.clients[id]; ok {
+		return existing
+	}
+	m.clients[id] = c
+	return c
+}
+
+// markErrorIfCurrent records a reauth failure only while c is still the published client of the
+// generation it was built under. The identity/generation check is repeated under the state
+// boundary, the same boundary complete uses to replace the token, so a completion that lands
+// after the first look cannot be overwritten by the stale callback. A client that an in-flight
+// read obtained before a restore or completion can outlive it; its callback must not mark the
+// newer row failed or delete the newer client from the cache.
+func (m *Manager) markErrorIfCurrent(id int64, generation uint64, c *dropbox.Client, msg string) {
+	release, err := m.beginMutation()
+	if err != nil {
+		// A restore owns the storage table. The failure belongs to the state being replaced.
+		return
+	}
+	defer release()
+
+	// Cheap pre-check for a client that has already been replaced. It is not authoritative:
+	// complete can replace the token after this look, so the check is repeated under the state
+	// boundary below.
+	m.mu.RLock()
+	current, ok := m.clients[id]
+	firstGeneration := m.clientGeneration
+	m.mu.RUnlock()
+	if !ok || current != c || firstGeneration != generation {
+		return
+	}
+
+	// Read the clock before taking the state boundary: a slow clock must not hold up a completion
+	// or lengthen the window in which this callback owns the state.
+	now := m.now().Unix()
+
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	// The first look ran without the ownership complete uses for the token replacement, so it can
+	// be stale by now. Recheck under that same boundary before writing the status.
+	m.mu.RLock()
+	current, ok = m.clients[id]
+	currentGeneration := m.clientGeneration
+	m.mu.RUnlock()
+	if !ok || current != c || currentGeneration != generation {
+		// A completion or restore replaced this client while the callback waited for the
+		// boundary. The failure belongs to the replaced state, not to the row now stored.
+		return
+	}
+	m.markErrorLocked(id, msg, now)
+}
+
+// markErrorLocked records a failure and invalidates the client cache as one state transition. The
+// caller owns the state boundary: stateMu for a reauth callback, or the restore write side of
+// mutationMu for ResetAndInitClients. No client build or completion can interleave with the write,
+// the reload and the eviction.
+func (m *Manager) markErrorLocked(id int64, msg string, now int64) {
+	_, _ = m.db.Exec(`UPDATE storages SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`, StatusError, msg, now, id)
 	_ = m.reload()
 	m.mu.Lock()
 	delete(m.clients, id)
@@ -328,6 +464,11 @@ type AuthStart struct {
 
 // Create inserts a pending storage and returns the authorization URL.
 func (m *Manager) Create(in Input) (*AuthStart, error) {
+	release, err := m.beginMutation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	m.mountMu.Lock()
 	defer m.mountMu.Unlock()
 	mount, err := m.checkMount(in.MountPath, 0)
@@ -381,6 +522,11 @@ func (m *Manager) Create(in Input) (*AuthStart, error) {
 
 // Reauth starts a new authorization for an existing storage.
 func (m *Manager) Reauth(id int64, mode string) (*AuthStart, error) {
+	release, err := m.beginMutation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if _, ok := m.Get(id); !ok {
 		return nil, errors.New("저장소를 찾을 수 없습니다")
 	}
@@ -419,6 +565,26 @@ func (m *Manager) startAuth(id int64, mode, redirect string) (*AuthStart, error)
 // ErrState is returned for unknown, expired or reused OAuth states.
 var ErrState = errors.New("인증 요청이 만료되었거나 이미 사용되었습니다. 저장소 화면에서 다시 인증을 시작하세요")
 
+// ErrRestoreInProgress is returned when a storage mutation arrives while a backup restore is
+// replacing the storage table and rebuilding the runtime.
+var ErrRestoreInProgress = errors.New("복원 작업이 진행 중입니다. 잠시 후 다시 시도하세요")
+
+// BeginRestore takes the storage mutation gate for a restore: in-flight mutations finish, new
+// mutations fail with ErrRestoreInProgress, and the caller must call EndRestore on every path.
+func (m *Manager) BeginRestore() { m.mutationMu.Lock() }
+
+// EndRestore releases the gate taken by BeginRestore.
+func (m *Manager) EndRestore() { m.mutationMu.Unlock() }
+
+// beginMutation admits one storage mutation unless a restore owns the gate. It never waits, so a
+// restore cannot deadlock behind a mutation that is itself waiting for the restore.
+func (m *Manager) beginMutation() (func(), error) {
+	if !m.mutationMu.TryRLock() {
+		return nil, ErrRestoreInProgress
+	}
+	return m.mutationMu.RUnlock, nil
+}
+
 // consumeState marks a state used and returns its storage and redirect URI.
 func (m *Manager) consumeState(state string) (int64, string, error) {
 	if state == "" {
@@ -436,6 +602,11 @@ func (m *Manager) consumeState(state string) (int64, string, error) {
 
 // CompleteWithState finishes an authorization from a redirect (callback or pasted URL).
 func (m *Manager) CompleteWithState(ctx context.Context, state, code string) (Storage, error) {
+	release, err := m.beginMutation()
+	if err != nil {
+		return Storage{}, err
+	}
+	defer release()
 	id, redirect, err := m.consumeState(state)
 	if err != nil {
 		return Storage{}, err
@@ -446,12 +617,17 @@ func (m *Manager) CompleteWithState(ctx context.Context, state, code string) (St
 // CompleteWithCode finishes a code-paste authorization for a storage. The pending state for
 // the storage must still be valid; it is consumed.
 func (m *Manager) CompleteWithCode(ctx context.Context, id int64, code string) (Storage, error) {
+	release, err := m.beginMutation()
+	if err != nil {
+		return Storage{}, err
+	}
+	defer release()
 	code = strings.TrimSpace(code)
 	if code == "" {
 		return Storage{}, &ValidationError{Field: "code", Msg: "Dropbox 화면에 표시된 코드를 붙여넣으세요"}
 	}
 	var redirect string
-	err := m.db.QueryRow(`UPDATE oauth_states SET used = 1 WHERE storage_id = ? AND used = 0 AND expires_at >= ? RETURNING redirect_uri`,
+	err = m.db.QueryRow(`UPDATE oauth_states SET used = 1 WHERE storage_id = ? AND used = 0 AND expires_at >= ? RETURNING redirect_uri`,
 		id, m.now().Unix()).Scan(&redirect)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Storage{}, ErrState
@@ -519,14 +695,21 @@ func (m *Manager) complete(ctx context.Context, id int64, code, redirect string)
 	if err != nil {
 		return Storage{}, err
 	}
-	if _, err := m.db.Exec(`UPDATE storages SET refresh_token_enc = ?, account_id = ?, account_email = ?, account_name = ?, status = ?, last_error = '', updated_at = ?, authorized_at = ? WHERE id = ?`,
-		rtEnc, acct.AccountID, acct.Email, acct.Name.DisplayName, StatusActive, m.now().Unix(), m.now().UnixMilli(), id); err != nil {
-		return Storage{}, err
-	}
-	m.mu.Lock()
-	delete(m.clients, id)
-	m.mu.Unlock()
-	if err := m.reload(); err != nil {
+	// The token write and the cache invalidation are one state replacement. Client builds under
+	// the same boundary, so a client that read the old token cannot be published after this write,
+	// and a stale reauth callback rechecks its identity under it before touching the status.
+	if err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
+		if _, err := m.db.Exec(`UPDATE storages SET refresh_token_enc = ?, account_id = ?, account_email = ?, account_name = ?, status = ?, last_error = '', updated_at = ?, authorized_at = ? WHERE id = ?`,
+			rtEnc, acct.AccountID, acct.Email, acct.Name.DisplayName, StatusActive, m.now().Unix(), m.now().UnixMilli(), id); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		delete(m.clients, id)
+		m.mu.Unlock()
+		return m.reload()
+	}(); err != nil {
 		return Storage{}, err
 	}
 	m.changed(id)
@@ -541,6 +724,11 @@ func (m *Manager) setError(id int64, msg string) {
 
 // Update edits name, mount, root and cache TTL.
 func (m *Manager) Update(id int64, in Input) (Storage, error) {
+	release, err := m.beginMutation()
+	if err != nil {
+		return Storage{}, err
+	}
+	defer release()
 	if _, ok := m.Get(id); !ok {
 		return Storage{}, errors.New("저장소를 찾을 수 없습니다")
 	}
@@ -571,12 +759,17 @@ func (m *Manager) Update(id int64, in Input) (Storage, error) {
 
 // Delete revokes the token (best effort) and removes the storage.
 func (m *Manager) Delete(ctx context.Context, id int64) error {
+	release, err := m.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	s, ok := m.Get(id)
 	if !ok {
 		return errors.New("저장소를 찾을 수 없습니다")
 	}
 	if s.Status != StatusPending {
-		if c, err := m.Client(id); err == nil {
+		if c, err := m.clientOwned(id); err == nil {
 			rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			_ = c.Revoke(rctx)
 			cancel()
