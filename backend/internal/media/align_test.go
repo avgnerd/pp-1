@@ -131,9 +131,8 @@ func TestStaleSegmentsDoNotRestartRun(t *testing.T) {
 // else; it takes a slot again on resume. Different players never share a session.
 func TestPausedSessionFreesSlot(t *testing.T) {
 	url := sample(t, "avi", "-c:v", "mpeg4", "-q:v", "5", "-c:a", "mp3")
-	m := NewManager(tool(t, "ffmpeg"), filepath.Join(t.TempDir(), "hls"), 1)
+	m := newManager(tool(t, "ffmpeg"), filepath.Join(t.TempDir(), "hls"), 1, 300*time.Millisecond)
 	defer m.Close()
-	m.Idle = 300 * time.Millisecond
 	src := Source{Key: "k", Client: "tab1", URL: func(context.Context) (string, error) { return url, nil }, Duration: 30, Mode: ModeTranscode, Height: 360, SrcH: 720}
 	a, err := m.Open(src)
 	if err != nil {
@@ -257,9 +256,8 @@ func TestAudioLongerThanVideo(t *testing.T) {
 // heartbeats) and must not wait forever for a segment that was cleaned up.
 func TestPausedSessionSurvivesWithHeartbeat(t *testing.T) {
 	url := sample(t, "avi", "-c:v", "mpeg4", "-q:v", "5", "-c:a", "mp3")
-	m := NewManager(tool(t, "ffmpeg"), filepath.Join(t.TempDir(), "hls"), 1)
+	m := newManager(tool(t, "ffmpeg"), filepath.Join(t.TempDir(), "hls"), 1, 300*time.Millisecond)
 	defer m.Close()
-	m.Idle = 300 * time.Millisecond
 	s, err := m.Open(Source{Key: "k", URL: func(context.Context) (string, error) { return url, nil }, Duration: 30, Mode: ModeTranscode, Height: 360, SrcH: 720})
 	if err != nil {
 		t.Fatal(err)

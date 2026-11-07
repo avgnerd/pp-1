@@ -85,7 +85,8 @@ type Manager struct {
 	// Idle is how long ffmpeg keeps running without segment requests (a paused player); it is
 	// then stopped and its transcode slot freed. The session itself lives until there were no
 	// requests for Idle and no heartbeat for 3*Idle (background tabs throttle timers to about
-	// one per minute).
+	// one per minute). The reaper takes this value when the manager is created; changing the
+	// field afterwards does not affect it.
 	Idle time.Duration
 
 	readRate bool // ffmpeg supports -readrate_initial_burst
@@ -101,9 +102,15 @@ type Manager struct {
 
 // NewManager creates a manager and starts its idle reaper. The temp dir is wiped first.
 func NewManager(ffmpeg, tempDir string, concurrency int) *Manager {
+	return newManager(ffmpeg, tempDir, concurrency, 60*time.Second)
+}
+
+// newManager creates a manager with the reaper's idle timeout fixed before the goroutine
+// starts, so the reaper never reads a field another goroutine can change.
+func newManager(ffmpeg, tempDir string, concurrency int, idle time.Duration) *Manager {
 	_ = os.RemoveAll(tempDir)
 	_ = os.MkdirAll(tempDir, 0o700)
-	m := &Manager{FFmpeg: ffmpeg, TempDir: tempDir, Limit: limiter.New(concurrency), Idle: 60 * time.Second,
+	m := &Manager{FFmpeg: ffmpeg, TempDir: tempDir, Limit: limiter.New(concurrency), Idle: idle,
 		sessions: map[string]*Session{}, byKey: map[string]*Session{}, stop: make(chan struct{}), done: make(chan struct{})}
 	if ffmpeg != "" {
 		cmd := exec.Command(ffmpeg, "-hide_banner", "-h", "full")
@@ -112,7 +119,7 @@ func NewManager(ffmpeg, tempDir string, concurrency int) *Manager {
 			m.readRate = true
 		}
 	}
-	go m.reaper()
+	go m.reaper(idle)
 	return m
 }
 
@@ -225,11 +232,11 @@ func (m *Manager) StopSessions() {
 	}
 }
 
-func (m *Manager) reaper() {
+func (m *Manager) reaper(idle time.Duration) {
 	defer close(m.done)
 	tick := 10 * time.Second
-	if m.Idle/2 < tick {
-		tick = max(m.Idle/2, 50*time.Millisecond)
+	if idle/2 < tick {
+		tick = max(idle/2, 50*time.Millisecond)
 	}
 	t := time.NewTicker(tick)
 	defer t.Stop()
@@ -247,10 +254,10 @@ func (m *Manager) reaper() {
 				switch {
 				case s.active > 0:
 					// A request is waiting for ffmpeg; never reap under it.
-				case sinceUse > m.Idle && sinceBeat > 3*m.Idle:
+				case sinceUse > idle && sinceBeat > 3*idle:
 					// No requests and no open player: the tab is gone.
 					gone = append(gone, s)
-				case sinceUse > m.Idle && (s.cmd != nil || s.slot):
+				case sinceUse > idle && (s.cmd != nil || s.slot):
 					// The player is open but paused: stop encoding and free the slot, keep the session.
 					pausedRuns = append(pausedRuns, s)
 				case s.cmd != nil:
@@ -267,9 +274,9 @@ func (m *Manager) reaper() {
 			for _, s := range pausedRuns {
 				s.startMu.Lock()
 				s.mu.Lock()
-				idle := s.active == 0 && time.Since(s.lastAccess) > m.Idle
+				paused := s.active == 0 && time.Since(s.lastAccess) > idle
 				s.mu.Unlock()
-				if idle {
+				if paused {
 					s.stopRun(false)
 				}
 				s.startMu.Unlock()

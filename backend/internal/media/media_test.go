@@ -158,9 +158,8 @@ func TestHLSRemux(t *testing.T) {
 }
 
 func TestIdleReaper(t *testing.T) {
-	m := NewManager("ffmpeg", filepath.Join(t.TempDir(), "hls"), 2)
+	m := newManager("ffmpeg", filepath.Join(t.TempDir(), "hls"), 2, 0)
 	defer m.Close()
-	m.Idle = 0
 	s, err := m.Open(Source{Key: "k", URL: func(context.Context) (string, error) { return "", nil }, Duration: 10, Mode: ModeTranscode})
 	if err != nil {
 		t.Fatal(err)
