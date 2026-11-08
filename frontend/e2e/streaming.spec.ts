@@ -1,10 +1,17 @@
 import { expect, test, type Locator, type Page } from "@playwright/test"
 
-type PlaybackState = { time: number; rate: number; paused: boolean; readyState: number }
-type PlaybackObservation = { state: PlaybackState; advanced: number | null }
+type PlaybackState = { time: number; rate: number; paused: boolean; readyState: number; src: string; frames: number }
+type PlaybackObservation = { state: PlaybackState; advanced: number | null; frames: number }
 type PlaybackWatch =
-  | { kind: "advance"; position?: number; target: number | "advance"; deadlineMs: number }
+  | { kind: "advance"; position?: number; target: number | "advance"; deadlineMs: number; minTime?: number; srcPrefix?: string; pauseAfter?: boolean }
   | { kind: "recovery"; minTime: number; advanceBy: number; captureDeadlineMs: number; advanceWindowMs: number }
+type LastValidState = { time: number; rate: number; paused: boolean; src: string; frames: number }
+
+// A restored position is compared with the last valid state captured before the trigger, not an
+// absolute seek value. The player saves timeupdate state and the fallback sample runs every frame;
+// one second covers the event cadence plus the first rendered frame after the restore, while still
+// rejecting an unrelated source (for example next.mp4 at 0).
+const RECOVERY_POSITION_TOLERANCE = 1
 
 const openRootMenu = (page: Page) => page.locator('[role="menu"][data-open]:not([data-submenu])')
 const openSubmenuPanel = (page: Page) => page.locator('[role="menu"][data-submenu][data-open]')
@@ -37,7 +44,19 @@ async function settleMenu(menu: Locator, requireFocus = false) {
 
 async function openSubmenu(page: Page, title: RegExp | string): Promise<Locator> {
   await expect(page.getByRole("alertdialog")).toBeHidden()
-  await page.getByRole("button", { name: "Settings", exact: true }).click()
+  const player = page.getByRole("group", { name: "Media player" })
+  // The controls auto-hide after a few idle seconds. A normal hover over the player shows them
+  // again; Playwright still treats opacity 0 as visible, so confirm the pointer reaches the button.
+  await player.hover()
+  await expect(player).toHaveAttribute("data-controls-visible", "")
+  const settings = page.getByRole("button", { name: "Settings", exact: true })
+  await expect(settings).toBeVisible()
+  await expect.poll(() => settings.evaluate(button => {
+    const rect = button.getBoundingClientRect()
+    const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+    return hit !== null && (hit === button || button.contains(hit))
+  })).toBe(true)
+  await settings.click()
   await settleMenu(openRootMenu(page))
   await page.getByRole("menuitem", { name: title }).click()
   const menu = openSubmenuPanel(page)
@@ -57,8 +76,8 @@ type PlaybackWatchHandle = { id: string }
 async function installPlaybackWatch(page: Page, spec: PlaybackWatch, previous?: Element): Promise<PlaybackWatchHandle> {
   const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
   await page.evaluate(({ watchSpec, previousElement, token }) => {
-    type State = { time: number; rate: number; paused: boolean; readyState: number }
-    type Observation = { state: State; advanced: number | null }
+    type State = { time: number; rate: number; paused: boolean; readyState: number; src: string; frames: number }
+    type Observation = { state: State; advanced: number | null; frames: number }
     type PageWatch = { token: string; result: Promise<Observation | null>; stop: () => void }
     const scope = window as Window & { __dvfsPlaybackWatch?: PageWatch }
     scope.__dvfsPlaybackWatch?.stop()
@@ -74,8 +93,8 @@ async function installPlaybackWatch(page: Page, spec: PlaybackWatch, previous?: 
       if (settled) return
       settled = true
       if (frame) cancelAnimationFrame(frame)
-      if (watchSpec.kind === "recovery") video?.pause()
-      resolveResult(state ? { state, advanced } : null)
+      if (watchSpec.kind === "recovery" || (watchSpec.kind === "advance" && watchSpec.pauseAfter)) video?.pause()
+      resolveResult(state ? { state, advanced, frames: video?.getVideoPlaybackQuality?.().totalVideoFrames ?? 0 } : null)
     }
     const stop = () => {
       if (settled) return
@@ -103,12 +122,16 @@ async function installPlaybackWatch(page: Page, spec: PlaybackWatch, previous?: 
       // budget must not capture and receive a fresh advance window.
       if (performance.now() > deadline) return finish(video, null)
       const replaced = video !== null && (previousElement ? video !== previousElement && !previousElement.isConnected : true)
-      if (!state && replaced && video && video.readyState >= 2 && !video.paused && !video.seeking) {
+      const qualifies = video !== null && replaced && video.readyState >= 2 && !video.paused && !video.seeking
+        && (watchSpec.kind !== "advance" || ((watchSpec.minTime === undefined || video.currentTime >= watchSpec.minTime)
+          && (watchSpec.srcPrefix === undefined || video.currentSrc.startsWith(watchSpec.srcPrefix))))
+      if (!state && qualifies && video) {
+        const frames = video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0
         if (watchSpec.kind === "advance") {
-          state = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState }
+          state = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState, src: video.currentSrc, frames }
           target = watchSpec.target === "advance" ? state.time + 0.5 : watchSpec.target
         } else if (video.currentTime >= watchSpec.minTime) {
-          state = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState }
+          state = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState, src: video.currentSrc, frames }
           target = state.time + watchSpec.advanceBy
           deadline = performance.now() + watchSpec.advanceWindowMs
         }
@@ -123,8 +146,8 @@ async function installPlaybackWatch(page: Page, spec: PlaybackWatch, previous?: 
 
 async function playbackWatchResult(page: Page, handle: PlaybackWatchHandle): Promise<PlaybackObservation | null> {
   return page.evaluate((token) => {
-    type State = { time: number; rate: number; paused: boolean; readyState: number }
-    const scope = window as Window & { __dvfsPlaybackWatch?: { token: string; result: Promise<{ state: State; advanced: number | null } | null> } }
+    type State = { time: number; rate: number; paused: boolean; readyState: number; src: string; frames: number }
+    const scope = window as Window & { __dvfsPlaybackWatch?: { token: string; result: Promise<{ state: State; advanced: number | null; frames: number } | null> } }
     if (scope.__dvfsPlaybackWatch?.token !== token) return null
     return scope.__dvfsPlaybackWatch.result
   }, handle.id)
@@ -139,6 +162,70 @@ async function cancelPlaybackWatch(page: Page, handle: PlaybackWatchHandle): Pro
   }, handle.id)
 }
 
+// Record the last valid state of the element that played before the failure. The element may be
+// disconnected and a replacement may appear; the expected position must come from this pre-failure
+// element after the explicit seek, not from a replacement that loads at 0.
+async function installLastValidSample(page: Page, element: Element, minimumTime: number): Promise<PlaybackWatchHandle> {
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  await page.evaluate(({ token, media, minimum }) => {
+    type Last = { time: number; rate: number; paused: boolean; src: string; frames: number }
+    type PageSample = { token: string; last: Last | null; stop: () => void }
+    const scope = window as Window & { __dvfsLastValid?: PageSample }
+    scope.__dvfsLastValid?.stop()
+    const video = media as HTMLVideoElement
+    const sample: PageSample = { token, last: null, stop: () => {} }
+    const events = ["seeking", "timeupdate", "play", "pause", "ratechange"] as const
+    let frame = 0
+    let stopped = false
+    const record = () => {
+      if (stopped || !video) return
+      if (!video.currentSrc.startsWith("blob:") || location.pathname !== "/demo.mp4") return
+      // The explicit seek is the lower provenance bound; a reset to 0 after the failure must not
+      // overwrite the position the user/test actually sought to.
+      if (video.currentTime < minimum - 0.5) return
+      sample.last = {
+        time: video.currentTime,
+        rate: video.playbackRate,
+        paused: video.paused,
+        src: video.currentSrc,
+        frames: video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
+      }
+    }
+    sample.stop = () => {
+      stopped = true
+      if (frame) cancelAnimationFrame(frame)
+      for (const event of events) video.removeEventListener(event, record)
+    }
+    scope.__dvfsLastValid = sample
+    for (const event of events) video.addEventListener(event, record)
+    record()
+    const tick = () => {
+      if (stopped) return
+      record()
+      frame = requestAnimationFrame(tick)
+    }
+    frame = requestAnimationFrame(tick)
+  }, { token: id, media: element, minimum: minimumTime })
+  return { id }
+}
+
+async function readLastValidSample(page: Page, handle: PlaybackWatchHandle): Promise<LastValidState | null> {
+  return page.evaluate((token) => {
+    type Last = { time: number; rate: number; paused: boolean; src: string; frames: number }
+    const scope = window as Window & { __dvfsLastValid?: { token: string; last: Last | null } }
+    return scope.__dvfsLastValid?.token === token ? scope.__dvfsLastValid.last : null
+  }, handle.id)
+}
+
+async function stopLastValidSample(page: Page, handle: PlaybackWatchHandle): Promise<void> {
+  await page.evaluate((token) => {
+    const scope = window as Window & { __dvfsLastValid?: { token: string; stop: () => void } }
+    if (scope.__dvfsLastValid?.token !== token) return
+    scope.__dvfsLastValid.stop()
+    delete scope.__dvfsLastValid
+  }, handle.id)
+}
+
 async function holdPlayback(page: Page) {
   return page.locator("video").evaluate((v: HTMLVideoElement) => {
     const wasPlaying = !v.paused && !v.ended
@@ -147,8 +234,8 @@ async function holdPlayback(page: Page) {
   })
 }
 
-async function ready(page: Page) {
-  await page.goto("/demo.mp4")
+async function ready(page: Page, navigate = true) {
+  if (navigate) await page.goto("/demo.mp4")
   await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeVisible()
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(1)
 }
@@ -167,6 +254,43 @@ async function convert(page: Page) {
   await page.keyboard.press("Escape")
 }
 
+test("initial converted playback advances before a real reload opens a new session", async ({ page }) => {
+  test.setTimeout(90_000)
+  const sessionIds: string[] = []
+  page.on("response", response => {
+    if (response.request().method() === "POST" && new URL(response.url()).pathname === "/api/media/hls") {
+      void response.json().then((body: { id?: string }) => { if (body.id) sessionIds.push(body.id) }).catch(() => {})
+    }
+  })
+  await ready(page)
+  await convert(page)
+  const advanceWatch = await installPlaybackWatch(page, { kind: "advance", position: 200, target: 201, deadlineMs: 15_000, pauseAfter: true })
+  let ahead: PlaybackObservation | null = null
+  try {
+    ahead = await playbackWatchResult(page, advanceWatch)
+  } finally {
+    await cancelPlaybackWatch(page, advanceWatch).catch(() => {})
+  }
+  expect(ahead).not.toBeNull()
+  if (!ahead?.advanced) throw new Error("playback did not advance past 201 within 15 s")
+  expect(ahead.advanced).toBeGreaterThan(201)
+  expect(ahead.state.readyState).toBeGreaterThanOrEqual(2)
+  expect(ahead.state.time).toBeGreaterThanOrEqual(200)
+  expect(ahead.state.src.startsWith("blob:")).toBe(true)
+  await expect(page).toHaveURL(/\/demo\.mp4$/)
+  await expect.poll(() => sessionIds.length).toBeGreaterThanOrEqual(1)
+  const firstSession = sessionIds[0]
+  await page.reload()
+  await ready(page, false)
+  await convert(page)
+  await expect(page).toHaveURL(/\/demo\.mp4$/)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentSrc.startsWith("blob:"))).toBe(true)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.duration)).toBe(240)
+  await expect.poll(() => sessionIds.length).toBeGreaterThanOrEqual(2)
+  expect(sessionIds[1]).not.toBe(firstSession)
+})
+
 for (const playing of [false, true]) {
   test(`pre-metadata exhaustion retains ${playing ? "playing" : "paused"} intent through manual retry`, async ({ page }) => {
     await ready(page)
@@ -179,33 +303,81 @@ for (const playing of [false, true]) {
     expect(baseline.paused).toBe(!playing)
     let failures = 0
     const failedMedia: { time: number; rate: number; paused: boolean; ready: number; frames: number }[] = []
-    await page.route("**/seg*.ts", async route => {
-      failedMedia.push(await page.locator("video").evaluate((v: HTMLVideoElement) => ({ time: v.currentTime, rate: v.playbackRate, paused: v.paused, ready: v.readyState, frames: v.getVideoPlaybackQuality().totalVideoFrames })))
-      failures++
-      await route.fulfill({ status: 410, json: { code: "past_end" } })
-    })
-    await page.locator("video").evaluate((v: HTMLVideoElement) => { v.currentTime = 200 })
-    const retry = page.getByRole("button", { name: "다시 재생", exact: true })
-    await expect(retry).toBeVisible()
-    expect(failures).toBeGreaterThanOrEqual(3)
-    const emptyReplacements = failedMedia.filter(media => media.ready === 0)
-    expect(emptyReplacements.length).toBeGreaterThanOrEqual(2)
-    for (const media of emptyReplacements) expect(media).toEqual({ time: 0, rate: 1, paused: true, ready: 0, frames: 0 })
-    await page.unroute("**/seg*.ts")
-    await retry.click()
-    await expect(retry).not.toBeVisible()
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
-    const restored = await page.locator("video").evaluate((v: HTMLVideoElement) => ({ time: v.currentTime, rate: v.playbackRate, paused: v.paused, frames: v.getVideoPlaybackQuality().totalVideoFrames }))
-    await test.info().attach("pre-metadata-recovery", { body: JSON.stringify({ baseline, failures, failedMedia, restored }), contentType: "application/json" })
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThanOrEqual(199.5)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeLessThan(210)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.75)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(!playing)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.getVideoPlaybackQuality().totalVideoFrames)).toBeGreaterThan(0)
-    if (playing) {
-      const before = await page.locator("video").evaluate((v: HTMLVideoElement) => ({ time: v.currentTime, frames: v.getVideoPlaybackQuality().totalVideoFrames }))
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(before.time + 0.5)
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.getVideoPlaybackQuality().totalVideoFrames)).toBeGreaterThan(before.frames + 4)
+    const seekTarget = 200
+    const seekVideo = await page.locator("video").elementHandle()
+    if (!seekVideo) throw new Error("the converted video was not found before the failure")
+    let sample: PlaybackWatchHandle | null = null
+    let playbackWatch: PlaybackWatchHandle | null = null
+    try {
+      sample = await installLastValidSample(page, seekVideo, seekTarget)
+      await page.route("**/seg*.ts", async route => {
+        failedMedia.push(await page.locator("video").evaluate((v: HTMLVideoElement) => ({ time: v.currentTime, rate: v.playbackRate, paused: v.paused, ready: v.readyState, frames: v.getVideoPlaybackQuality().totalVideoFrames })))
+        failures++
+        await route.fulfill({ status: 410, json: { code: "past_end" } })
+      })
+      await seekVideo.evaluate((v: HTMLVideoElement, target) => { v.currentTime = target }, seekTarget)
+      const retry = page.getByRole("button", { name: "다시 재생", exact: true })
+      await expect(retry).toBeVisible()
+      expect(failures).toBeGreaterThanOrEqual(3)
+      const emptyReplacements = failedMedia.filter(media => media.ready === 0)
+      expect(emptyReplacements.length).toBeGreaterThanOrEqual(2)
+      for (const media of emptyReplacements) expect(media).toEqual({ time: 0, rate: 1, paused: true, ready: 0, frames: 0 })
+      await page.unroute("**/seg*.ts")
+      const expected = await readLastValidSample(page, sample)
+      expect(expected).not.toBeNull()
+      if (!expected) throw new Error("no valid demo media state was recorded before the retry")
+      // The expected belongs to the pre-failure element after the explicit seek. A restore to 0 or
+      // to a pre-seek position must fail here instead of being normalized by the ±1 comparison.
+      expect(expected.time).toBeGreaterThanOrEqual(seekTarget - 0.5)
+      expect(expected.time).toBeLessThan(240)
+      expect(expected.src.startsWith("blob:")).toBe(true)
+      const beforeRetry = await page.locator("video").elementHandle()
+      if (!beforeRetry) throw new Error("the media element was not found before the retry")
+      if (playing) {
+        playbackWatch = await installPlaybackWatch(page, {
+          kind: "advance",
+          target: "advance",
+          minTime: expected.time - RECOVERY_POSITION_TOLERANCE,
+          srcPrefix: "blob:",
+          deadlineMs: 15_000,
+          pauseAfter: true,
+        }, beforeRetry)
+      }
+      await retry.click()
+      const observed = playbackWatch ? await playbackWatchResult(page, playbackWatch) : null
+      await expect(retry).not.toBeVisible()
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
+      if (playing) {
+        expect(observed).not.toBeNull()
+        if (!observed) throw new Error("playback did not resume after the manual retry")
+        expect(observed.state.readyState).toBeGreaterThanOrEqual(2)
+        expect(observed.state.rate).toBe(1.75)
+        expect(observed.state.paused).toBe(false)
+        expect(observed.state.src.startsWith("blob:")).toBe(true)
+        expect(observed.state.time).toBeGreaterThanOrEqual(expected.time - RECOVERY_POSITION_TOLERANCE)
+        expect(observed.state.time).toBeLessThanOrEqual(expected.time + RECOVERY_POSITION_TOLERANCE)
+        expect(observed.state.frames).toBeGreaterThan(0)
+        expect(observed.advanced).not.toBeNull()
+        expect(observed.advanced ?? Number.NEGATIVE_INFINITY).toBeGreaterThan(observed.state.time + 0.5)
+        expect(observed.frames).toBeGreaterThan(observed.state.frames + 4)
+        await test.info().attach("pre-metadata-recovery", { body: JSON.stringify({ baseline, failures, failedMedia, expected, observed }), contentType: "application/json" })
+        // The watch froze the state after it observed playback, rate, frames and the advance inside
+        // the page, so the delayed protocol return cannot let the file auto-next.
+        await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
+      } else {
+        const restored = await page.locator("video").evaluate((v: HTMLVideoElement) => ({ time: v.currentTime, rate: v.playbackRate, paused: v.paused, src: v.currentSrc, frames: v.getVideoPlaybackQuality().totalVideoFrames }))
+        await test.info().attach("pre-metadata-recovery", { body: JSON.stringify({ baseline, failures, failedMedia, expected, restored }), contentType: "application/json" })
+        expect(restored.paused).toBe(true)
+        expect(restored.rate).toBe(1.75)
+        expect(restored.src.startsWith("blob:")).toBe(true)
+        expect(restored.frames).toBeGreaterThan(0)
+        expect(restored.time).toBeGreaterThanOrEqual(expected.time - RECOVERY_POSITION_TOLERANCE)
+        expect(restored.time).toBeLessThanOrEqual(expected.time + RECOVERY_POSITION_TOLERANCE)
+      }
+      await expect(page).toHaveURL(/\/demo\.mp4$/)
+    } finally {
+      if (playbackWatch) await cancelPlaybackWatch(page, playbackWatch).catch(() => {})
+      if (sample) await stopLastValidSample(page, sample).catch(() => {})
     }
   })
 }
@@ -216,23 +388,19 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     await ready(page)
     await convert(page)
 
-    const advanceWatch = await installPlaybackWatch(page, { kind: "advance", position: 200, target: 201, deadlineMs: 15_000 })
-    let ahead: PlaybackObservation | null = null
-    try {
-      ahead = await playbackWatchResult(page, advanceWatch)
-    } finally {
-      await cancelPlaybackWatch(page, advanceWatch).catch(() => {})
-    }
-    expect(ahead).not.toBeNull()
-    if (!ahead?.advanced) throw new Error("playback did not advance past 201 within 15 s")
-    expect(ahead.advanced).toBeGreaterThan(201)
     await page.reload()
-    await ready(page)
+    await ready(page, false)
     await convert(page)
     if (fullscreen) {
       await page.getByRole("button", { name: "Enter fullscreen", exact: true }).click()
       await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
     }
+    const sampleVideo = playing ? await page.locator("video").elementHandle() : null
+    if (playing && !sampleVideo) throw new Error("the converted video was not found before the failure")
+    let sample: PlaybackWatchHandle | null = null
+    // The sampler is installed before the heartbeat, so its cleanup must cover the heartbeat too.
+    try {
+      sample = sampleVideo ? await installLastValidSample(page, sampleVideo, 200) : null
 
     let healthy = false
     let failures = 0
@@ -251,12 +419,17 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
         await route.fulfill({ status: 410, json: { code: "past_end" } })
       } else await route.continue()
     })
-    await page.locator("video").evaluate(async (v: HTMLVideoElement, play) => {
+    const seekVideo = playing ? sampleVideo : null
+    if (seekVideo) await seekVideo.evaluate(async (v: HTMLVideoElement) => {
       v.playbackRate = 1.75
-      if (play) await v.play()
-      else v.pause()
+      await v.play()
       v.currentTime = 200
-    }, playing)
+    })
+    else await page.locator("video").evaluate((v: HTMLVideoElement) => {
+      v.playbackRate = 1.75
+      v.pause()
+      v.currentTime = 200
+    })
     await expect.poll(() => failures).toBeGreaterThanOrEqual(3)
     await expect.poll(() => opens).toBe(2)
     const dialog = page.getByRole("alertdialog")
@@ -282,11 +455,20 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     if (!old) throw new Error("the video element was replaced before the retry")
     let recoveryWatch: PlaybackWatchHandle | null = null
     try {
+      const expected = sample ? await readLastValidSample(page, sample) : null
+      if (playing) {
+        expect(expected).not.toBeNull()
+        if (!expected) throw new Error("no valid demo media state was recorded before the retry")
+        expect(expected.time).toBeGreaterThanOrEqual(199.5)
+        expect(expected.time).toBeLessThan(240)
+        expect(expected.src.startsWith("blob:")).toBe(true)
+      }
+      const expectedTime = expected?.time ?? 199.5
       // Install the observation before the retry input: if the click's response is slow, the
       // replacement can otherwise resume, advance and auto-next before an observation installed
       // after the click returns exists.
       recoveryWatch = playing
-        ? await installPlaybackWatch(page, { kind: "recovery", minTime: 199.5, advanceBy: 0.5, captureDeadlineMs: 30_000, advanceWindowMs: 15_000 }, old)
+        ? await installPlaybackWatch(page, { kind: "recovery", minTime: expectedTime - RECOVERY_POSITION_TOLERANCE, advanceBy: 0.5, captureDeadlineMs: 30_000, advanceWindowMs: 15_000 }, old)
         : null
       await retry.click()
       const observed = recoveryWatch ? await playbackWatchResult(page, recoveryWatch) : null
@@ -294,14 +476,16 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
       await expect(dialog).not.toBeVisible()
       await expect(retry).not.toBeVisible()
       await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentSrc.startsWith("blob:"))).toBe(true)
       if (playing) {
         expect(observed).not.toBeNull()
         if (!observed) throw new Error("playback did not resume after the manual retry")
         expect(observed.state.readyState).toBeGreaterThanOrEqual(2)
         expect(observed.state.rate).toBe(1.75)
         expect(observed.state.paused).toBe(false)
-        expect(observed.state.time).toBeGreaterThanOrEqual(199.5)
-        expect(observed.state.time).toBeLessThan(210)
+        expect(observed.state.src.startsWith("blob:")).toBe(true)
+        expect(observed.state.time).toBeGreaterThanOrEqual(expectedTime - RECOVERY_POSITION_TOLERANCE)
+        expect(observed.state.time).toBeLessThanOrEqual(expectedTime + RECOVERY_POSITION_TOLERANCE)
         expect(observed.advanced).not.toBeNull()
         expect(observed.advanced ?? Number.NEGATIVE_INFINITY).toBeGreaterThan(observed.state.time + 0.5)
         await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
@@ -315,6 +499,9 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
       if (fullscreen) await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
     } finally {
       if (recoveryWatch) await cancelPlaybackWatch(page, recoveryWatch).catch(() => {})
+    }
+    } finally {
+      if (sample) await stopLastValidSample(page, sample).catch(() => {})
     }
   })
 }
@@ -436,12 +623,17 @@ test("VR renders current decoded frames after conversion, HLS recovery and a fre
   // the assertions. The VR view still renders loadeddata/seeked frames while paused.
   const held = await holdPlayback(page)
   await test.info().attach("vr-hold", { body: JSON.stringify(held), contentType: "application/json" })
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
 
   await openSubmenu(page, /화질/)
   await page.getByRole("menuitemradio", { name: /^원본/ }).click()
   await page.keyboard.press("Escape")
   await expect(page.locator("video")).toHaveAttribute("src", /api\/fs\/raw/)
   await expect(page.locator("video")).toHaveAttribute("data-vr-upload", "true")
+  // The source switch replaced the element; freeze the new one before the error/fresh-link steps.
+  const switched = await holdPlayback(page)
+  await test.info().attach("vr-hold-switched", { body: JSON.stringify(switched), contentType: "application/json" })
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
   const original = await page.locator("video").elementHandle()
   await page.locator("video").evaluate((v: HTMLVideoElement) => {
     Object.defineProperty(v, "error", { configurable: true, value: { code: 2, message: "injected original network failure" } })
