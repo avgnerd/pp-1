@@ -1,5 +1,8 @@
 import { expect, test, type Locator, type Page } from "@playwright/test"
 
+type RecoveryState = { time: number; rate: number; paused: boolean; readyState: number }
+type RecoveryObservation = { restored: RecoveryState; advanced: number | null; pausedAfter: boolean }
+
 // Base UI focuses a submenu one task after it opens and the browser scrolls the page to reveal
 // the focused item. The popover is anchored to the controls, so that scroll moves it under the
 // pointer: a click sent before the scroll finishes presses the old screen position.
@@ -148,50 +151,72 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     healthy = true
     const old = await page.locator("video").elementHandle()
     if (!old) throw new Error("the video element was replaced before the retry")
-    // The recovered element keeps playing while Playwright polls, so on a slow runner the file
-    // plays out and auto-next leaves the page before the position assertions run. Capture and
-    // pause at the instant playback resumes, then resume to prove it still advances.
+    // The recovered element keeps playing while Playwright waits. On a slow runner a round trip
+    // can take longer than the restored position's remaining window, so the file ends and
+    // auto-next leaves the page before an external poll can sample it. Observe the resume, its
+    // actual advance and the pause inside the page, then assert on that one captured state.
     const resumed = playing
-      ? page.evaluate((previous: Element) => new Promise<{ time: number; rate: number; paused: boolean; readyState: number } | null>(resolve => {
+      ? page.evaluate((previous: Element) => new Promise<RecoveryObservation | null>(resolve => {
+          const state = window as Window & { __dvfsRecoveryCancelled?: boolean }
           const deadline = performance.now() + 30_000
-          const tick = () => {
+          let restored: RecoveryState | null = null
+          let advanceDeadline = 0
+          const finish = (advanced: number | null) => {
             const video = document.querySelector("video")
-            if (video && video !== previous && !previous.isConnected && video.readyState >= 2 && video.currentTime >= 199.5 && !video.paused && !video.seeking) {
-              const state = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState }
-              video.pause()
-              resolve(state)
-              return
+            video?.pause()
+            resolve(restored ? { restored, advanced, pausedAfter: video?.paused ?? false } : null)
+          }
+          const tick = () => {
+            if (state.__dvfsRecoveryCancelled) return resolve(null)
+            const video = document.querySelector("video")
+            if (!restored && video && video !== previous && !previous.isConnected && video.readyState >= 2 && video.currentTime >= 199.5 && !video.paused && !video.seeking) {
+              restored = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState }
+              advanceDeadline = performance.now() + 15_000
             }
-            if (performance.now() > deadline) resolve(null)
-            else requestAnimationFrame(tick)
+            if (restored && video) {
+              if (video.currentTime > restored.time + 0.5) return finish(video.currentTime)
+              if (performance.now() > advanceDeadline) return finish(null)
+            }
+            if (performance.now() > deadline) return resolve(null)
+            requestAnimationFrame(tick)
           }
           tick()
         }), old)
       : null
-    await retry.click()
-    await expect.poll(() => old.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
-    await expect(dialog).not.toBeVisible()
-    await expect(retry).not.toBeVisible()
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
-    if (playing) {
-      const restored = await resumed
-      expect(restored).not.toBeNull()
-      if (!restored) throw new Error("playback did not resume after the manual retry")
-      expect(restored.readyState).toBeGreaterThanOrEqual(2)
-      expect(restored.rate).toBe(1.75)
-      expect(restored.paused).toBe(false)
-      expect(restored.time).toBeGreaterThanOrEqual(199.5)
-      expect(restored.time).toBeLessThan(210)
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
-      await page.locator("video").evaluate(async (v: HTMLVideoElement) => { await v.play() })
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(restored.time + 0.5)
-    } else {
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.75)
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThanOrEqual(199.5)
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeLessThan(210)
+    try {
+      await retry.click()
+      await expect.poll(() => old.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
+      await expect(dialog).not.toBeVisible()
+      await expect(retry).not.toBeVisible()
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
+      if (playing) {
+        if (!resumed) throw new Error("the playing observation was not started")
+        const observed = await resumed
+        expect(observed).not.toBeNull()
+        if (!observed) throw new Error("playback did not resume after the manual retry")
+        expect(observed.restored.readyState).toBeGreaterThanOrEqual(2)
+        expect(observed.restored.rate).toBe(1.75)
+        expect(observed.restored.paused).toBe(false)
+        expect(observed.restored.time).toBeGreaterThanOrEqual(199.5)
+        expect(observed.restored.time).toBeLessThan(210)
+        expect(observed.advanced).not.toBeNull()
+        expect(observed.advanced ?? Number.NEGATIVE_INFINITY).toBeGreaterThan(observed.restored.time + 0.5)
+        expect(observed.pausedAfter).toBe(true)
+      } else {
+        await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
+        await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.75)
+        await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThanOrEqual(199.5)
+        await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeLessThan(210)
+      }
+      await expect(page).toHaveURL(/\/demo\.mp4$/)
+      if (fullscreen) await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
+    } finally {
+      if (resumed) {
+        void page.evaluate(() => {
+          (window as Window & { __dvfsRecoveryCancelled?: boolean }).__dvfsRecoveryCancelled = true
+        }).catch(() => {})
+      }
     }
-    if (fullscreen) await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
   })
 }
 

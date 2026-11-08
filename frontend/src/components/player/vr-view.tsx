@@ -71,6 +71,9 @@ export function VRView({ video, projection, stereo }: Props) {
         })
       }
       watchFrames()
+      const invalidate = () => { dirty = true }
+      video.addEventListener("loadeddata", invalidate)
+      video.addEventListener("seeked", invalidate)
       const maxLon = projection === "180" ? 85 : Infinity
       const clamp = () => {
         lat = Math.max(-85, Math.min(85, lat))
@@ -136,8 +139,10 @@ export function VRView({ video, projection, stereo }: Props) {
 
       const target = new THREE.Vector3()
       renderer.setAnimationLoop(() => {
-        // Without frame callbacks a paused seek has no invalidation signal, so keep repainting.
-        if (!dirty && video.paused && frameDriven) return
+        // With frame callbacks, a new decoded frame, camera input or layout change is the only
+        // reason to repaint. Without them the pre-change continuous loop stays, because a paused
+        // seek or the first decoded frame has no frame callback to invalidate the last image.
+        if (frameDriven && !dirty) return
         dirty = false
         const phi = THREE.MathUtils.degToRad(90 - lat)
         const theta = THREE.MathUtils.degToRad(lon - 90)
@@ -154,6 +159,8 @@ export function VRView({ video, projection, stereo }: Props) {
       cleanup = () => {
         renderer.setAnimationLoop(null)
         if (frameRequest !== undefined) video.cancelVideoFrameCallback(frameRequest)
+        video.removeEventListener("loadeddata", invalidate)
+        video.removeEventListener("seeked", invalidate)
         ro.disconnect()
         el.removeEventListener("pointerdown", onDown)
         el.removeEventListener("pointermove", onMove)
