@@ -599,22 +599,40 @@ test("VR renders current decoded frames after conversion, HLS recovery and a fre
   await page.getByRole("menuitemradio", { name: "360°단일", exact: true }).click()
   await page.keyboard.press("Escape")
   await expect(page.locator("[data-vr] canvas")).toBeVisible()
-  await page.locator("video").evaluate(async (v: HTMLVideoElement) => { await v.play() })
-  await expect(page.locator("video")).toHaveAttribute("data-vr-upload", "true")
+  // Capture the VR element before play. The first played frames are the slowest part on a
+  // software-rendered runner, so resolving this locator after play adds an avoidable wait there.
+  // The handle below proves play/upload and the conversion replacement on the same element.
   const old = await page.locator("video").elementHandle()
+  if (!old) throw new Error("VR video element is missing after enabling 360° mode")
+  await old.evaluate(async (v: HTMLVideoElement) => { await v.play() })
+  await expect.poll(() => old.evaluate((v: HTMLVideoElement) => v.dataset.vrUpload === "true")).toBe(true)
   // This is the only menu call while playing: pause explicitly as a user would so the auto-hiding
   // controls stay reachable across the ready-to-click delay. The post-conversion play below proves
-  // the source replacement still plays.
-  const heldBeforeConvert = await holdPlayback(page)
+  // the source replacement still plays. Reusing the handle avoids a second locator resolution, and
+  // the current check fails loudly if anything replaced the element before conversion.
+  const heldBeforeConvert = await old.evaluate((v: HTMLVideoElement) => {
+    const wasPlaying = !v.paused && !v.ended
+    v.pause()
+    return { wasPlaying, time: v.currentTime, rate: v.playbackRate, current: v.isConnected && v === document.querySelector("video") }
+  })
+  if (!heldBeforeConvert.current) throw new Error("VR video element was replaced before conversion")
   await test.info().attach("vr-before-convert-hold", { body: JSON.stringify(heldBeforeConvert), contentType: "application/json" })
-  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
+  await expect.poll(() => old.evaluate((v: HTMLVideoElement) => v.paused && v.isConnected && v === document.querySelector("video"))).toBe(true)
   await convert(page)
-  await expect.poll(() => old?.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
-  await page.locator("video").evaluate(async (v: HTMLVideoElement) => { await v.play() })
-  await expect(page.locator("video")).toHaveAttribute("data-vr-upload", "true")
-  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => Number(v.dataset.vrFrames ?? 0))).toBeGreaterThan(1)
-
+  await expect.poll(() => old.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
   const converted = await page.locator("video").elementHandle()
+  if (!converted) throw new Error("converted video element is missing after conversion")
+  const convertedState = await converted.evaluate((v: HTMLVideoElement) => ({
+    connected: v.isConnected,
+    current: v === document.querySelector("video"),
+    blob: v.currentSrc.startsWith("blob:"),
+  }))
+  if (!convertedState.connected || !convertedState.current || !convertedState.blob) {
+    throw new Error(`converted video element is not the current HLS element: ${JSON.stringify(convertedState)}`)
+  }
+  await converted.evaluate(async (v: HTMLVideoElement) => { await v.play() })
+  await expect.poll(() => converted.evaluate((v: HTMLVideoElement) => v.dataset.vrUpload === "true")).toBe(true)
+  await expect.poll(() => converted.evaluate((v: HTMLVideoElement) => Number(v.dataset.vrFrames ?? 0))).toBeGreaterThan(1)
   let injected = false
   await page.route("**/seg*.ts", async route => {
     if (!injected && /seg(4[5-9]|5[0-9])\.ts/.test(route.request().url())) {
@@ -622,9 +640,13 @@ test("VR renders current decoded frames after conversion, HLS recovery and a fre
       await route.fulfill({ status: 410, body: "expired session" })
     } else await route.continue()
   })
-  await page.locator("video").evaluate((v: HTMLVideoElement) => { v.currentTime = 200 })
+  // Keep the converted handle honest through the HLS trigger. If anything replaced it, fail here
+  // instead of letting the later disconnect assertion pass on an element that was already gone.
+  const beforeTrigger = await converted.evaluate((v: HTMLVideoElement) => v.isConnected && v === document.querySelector("video"))
+  if (!beforeTrigger) throw new Error("converted video element was replaced before the HLS failure trigger")
+  await converted.evaluate((v: HTMLVideoElement) => { v.currentTime = 200 })
   await expect.poll(() => injected).toBe(true)
-  await expect.poll(() => converted?.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
+  await expect.poll(() => converted.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
   await expect(page.locator("video")).toHaveAttribute("data-vr-upload", "true")
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => Number(v.dataset.vrFrames ?? 0))).toBeGreaterThan(1)
 
