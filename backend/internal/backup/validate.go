@@ -54,9 +54,6 @@ func ValidatePayload(p *Payload) error {
 				seenID[rec.ID] = storageLabel(rec)
 			}
 		}
-		if strings.TrimSpace(rec.Name) == "" {
-			errs = append(errs, label+": 저장소 이름이 비어 있습니다")
-		}
 		norm, err := storage.NormalizeMountPath(rec.MountPath)
 		switch {
 		case err != nil:

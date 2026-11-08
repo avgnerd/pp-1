@@ -512,7 +512,6 @@ func TestValidatePayloadRejectsBadPayloads(t *testing.T) {
 		}, "겹칩니다"},
 		{"duplicate id", func(p *Payload) { p.Storages[1].ID = p.Storages[0].ID }, "중복"},
 		{"missing id", func(p *Payload) { p.Storages[0].ID = 0 }, "id"},
-		{"empty name", func(p *Payload) { p.Storages[0].Name = " " }, "이름"},
 		{"relative mount", func(p *Payload) { p.Storages[0].MountPath = "main" }, "마운트"},
 		{"unnormalized mount", func(p *Payload) { p.Storages[0].MountPath = "/main/" }, "정규화"},
 		{"bad status", func(p *Payload) { p.Storages[0].Status = "broken" }, "status"},

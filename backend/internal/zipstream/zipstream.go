@@ -39,17 +39,21 @@ type Opener func(ctx context.Context, storageID int64, dbxPath string) (io.ReadC
 // maxFiles bounds the expansion.
 func Expand(ctx context.Context, svc *vfs.Service, vpaths []string, maxFiles int) ([]File, error) {
 	var out []File
-	used := map[string]int{}
+	used := map[string]bool{}
 	add := func(f File) error {
 		if len(out) >= maxFiles {
 			return fmt.Errorf("파일이 %d개를 넘어 한 번에 압축할 수 없습니다. 선택을 나누어 받으세요", maxFiles)
 		}
-		key := strings.ToLower(f.ZipName)
-		if n := used[key]; n > 0 {
-			ext := path.Ext(f.ZipName)
-			f.ZipName = fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(f.ZipName, ext), n+1, ext)
+		// The suffix must skip over every name already claimed, including one an earlier suffix
+		// produced and one the selection itself carries, or two entries end up with one name.
+		ext := path.Ext(f.ZipName)
+		stem := strings.TrimSuffix(f.ZipName, ext)
+		name := f.ZipName
+		for n := 1; used[strings.ToLower(name)]; n++ {
+			name = fmt.Sprintf("%s (%d)%s", stem, n+1, ext)
 		}
-		used[key]++
+		used[strings.ToLower(name)] = true
+		f.ZipName = name
 		out = append(out, f)
 		return nil
 	}

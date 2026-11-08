@@ -173,7 +173,7 @@ func (s *Service) List(ctx context.Context, vpath string, opt ListOptions) (*Lis
 			if m.IsDir() {
 				e.Type = TypeFolder
 				if v, ok := s.Cache.Get(FolderSizeKey(t.Storage.ID, path.Join(t.DbxPath, m.Name))); ok {
-					sz := v.(int64)
+					sz := v.(SizeProgress).Bytes
 					e.Size = &sz
 				}
 			} else {

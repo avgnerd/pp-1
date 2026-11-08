@@ -31,7 +31,7 @@ func (s *Service) FolderSize(ctx context.Context, vpath string, lim *limiter.Lim
 	}
 	key := FolderSizeKey(t.Storage.ID, t.DbxPath)
 	if v, ok := s.Cache.Get(key); ok {
-		p := SizeProgress{Bytes: v.(int64), Done: true}
+		p := v.(SizeProgress)
 		return p, nil
 	}
 	if !lim.TryAcquire() {
@@ -73,6 +73,6 @@ func (s *Service) FolderSize(ctx context.Context, vpath string, lim *limiter.Lim
 	if p.Folders > 0 && t.DbxPath != "/" {
 		p.Folders-- // the recursive listing includes the folder itself
 	}
-	s.Cache.Set(key, p.Bytes, 16, t.Storage.CacheTTL())
+	s.Cache.Set(key, p, 40, t.Storage.CacheTTL())
 	return p, nil
 }

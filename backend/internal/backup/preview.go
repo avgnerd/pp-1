@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// PreviewTTL is how long a preview_id stays usable after the preview was produced.
-var PreviewTTL = 5 * time.Minute
+// PreviewTTL is how long a preview_id stays usable after the preview was produced. The restore
+// requirements give the admin ten minutes to review a preview.
+var PreviewTTL = 10 * time.Minute
 
 // ErrPreviewInvalid covers every reason a preview_id cannot be applied: unknown, already used,
 // expired, or bound to another login session. The cases are deliberately not distinguished so a
