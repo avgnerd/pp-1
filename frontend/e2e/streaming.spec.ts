@@ -1,24 +1,150 @@
 import { expect, test, type Locator, type Page } from "@playwright/test"
 
-type RecoveryState = { time: number; rate: number; paused: boolean; readyState: number }
-type RecoveryObservation = { restored: RecoveryState; advanced: number | null; pausedAfter: boolean }
+type PlaybackState = { time: number; rate: number; paused: boolean; readyState: number }
+type PlaybackObservation = { state: PlaybackState; advanced: number | null }
+type PlaybackWatch =
+  | { kind: "advance"; position?: number; target: number | "advance"; deadlineMs: number }
+  | { kind: "recovery"; minTime: number; advanceBy: number; captureDeadlineMs: number; advanceWindowMs: number }
 
-// Base UI focuses a submenu one task after it opens and the browser scrolls the page to reveal
-// the focused item. The popover is anchored to the controls, so that scroll moves it under the
-// pointer: a click sent before the scroll finishes presses the old screen position.
-async function settleSubmenu(page: Page, menu: Locator) {
-  await expect.poll(() => menu.evaluate(node => node.contains(document.activeElement))).toBe(true)
-  await page.evaluate(() => new Promise<void>(resolve => {
-    let last = window.scrollY
+const openRootMenu = (page: Page) => page.locator('[role="menu"][data-open]:not([data-submenu])')
+const openSubmenuPanel = (page: Page) => page.locator('[role="menu"][data-submenu][data-open]')
+
+// Base UI focuses a menu one task after it opens and the browser scrolls the page to reveal the
+// focused item. The popover is anchored to the controls, so a click sent while the page, focus or
+// popover is still moving presses the old screen position and never reaches the item. Wait for any
+// dialog to close, the menu attributes to settle, focus to enter the menu, and its box and the page
+// scroll to stay still; the normal locator click follows.
+async function settleMenu(menu: Locator, requireFocus = false) {
+  await expect(menu).toBeVisible()
+  await expect(menu).not.toHaveAttribute("data-starting-style", "")
+  // Base UI focuses the selected item when a submenu opens, but a root menu can keep focus on the
+  // trigger, so only the submenu requires focus to be inside.
+  if (requireFocus) await expect.poll(() => menu.evaluate(node => node.contains(document.activeElement))).toBe(true)
+  await menu.evaluate(node => new Promise<void>(resolve => {
+    let lastY = window.scrollY
+    let last = node.getBoundingClientRect()
     let stable = 0
     const tick = () => {
-      if (window.scrollY === last) stable++
-      else { stable = 0; last = window.scrollY }
+      const box = node.getBoundingClientRect()
+      if (window.scrollY === lastY && box.top === last.top && box.left === last.left && box.width === last.width && box.height === last.height) stable++
+      else { stable = 0; lastY = window.scrollY; last = box }
       if (stable >= 2) resolve()
       else requestAnimationFrame(tick)
     }
     requestAnimationFrame(tick)
   }))
+}
+
+async function openSubmenu(page: Page, title: RegExp | string): Promise<Locator> {
+  await expect(page.getByRole("alertdialog")).toBeHidden()
+  await page.getByRole("button", { name: "Settings", exact: true }).click()
+  await settleMenu(openRootMenu(page))
+  await page.getByRole("menuitem", { name: title }).click()
+  const menu = openSubmenuPanel(page)
+  await settleMenu(menu, true)
+  return menu
+}
+
+type PlaybackWatchHandle = { id: string }
+
+// Install an in-page playback observation and return only after it is scheduled. The caller can
+// then dispatch the trigger (a retry click) with no gap in which the replacement could play, reach
+// the end and auto-next before the observation exists. "advance" optionally seeks and starts
+// playback, then waits for currentTime to pass an absolute target or the captured time + 0.5 s.
+// "recovery" waits for the replacement element, captures it once it plays at the restored position,
+// proves the same advance, and pauses it. The result promise never rejects, settles exactly once,
+// and stop() cancels the rAF loop; every caller cancels in a finally.
+async function installPlaybackWatch(page: Page, spec: PlaybackWatch, previous?: Element): Promise<PlaybackWatchHandle> {
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  await page.evaluate(({ watchSpec, previousElement, token }) => {
+    type State = { time: number; rate: number; paused: boolean; readyState: number }
+    type Observation = { state: State; advanced: number | null }
+    type PageWatch = { token: string; result: Promise<Observation | null>; stop: () => void }
+    const scope = window as Window & { __dvfsPlaybackWatch?: PageWatch }
+    scope.__dvfsPlaybackWatch?.stop()
+    let frame = 0
+    let state: State | null = null
+    let target = 0
+    let settled = false
+    let resolveResult: (value: Observation | null) => void = () => {}
+    const result = new Promise<Observation | null>(resolve => { resolveResult = resolve })
+    const start = performance.now()
+    let deadline = watchSpec.kind === "advance" ? start + watchSpec.deadlineMs : start + watchSpec.captureDeadlineMs
+    const finish = (video: HTMLVideoElement | null, advanced: number | null) => {
+      if (settled) return
+      settled = true
+      if (frame) cancelAnimationFrame(frame)
+      if (watchSpec.kind === "recovery") video?.pause()
+      resolveResult(state ? { state, advanced } : null)
+    }
+    const stop = () => {
+      if (settled) return
+      settled = true
+      if (frame) cancelAnimationFrame(frame)
+      resolveResult(null)
+    }
+    scope.__dvfsPlaybackWatch = { token, result, stop }
+    if (watchSpec.kind === "advance" && watchSpec.position !== undefined) {
+      const video = document.querySelector("video")
+      if (video) {
+        video.currentTime = watchSpec.position
+        try {
+          const playing = video.play()
+          if (playing) void playing.catch(() => finish(video, null))
+        } catch {
+          finish(video, null)
+        }
+      }
+    }
+    const tick = () => {
+      if (settled) return
+      const video = document.querySelector("video")
+      // Check the active phase deadline before capturing: a frame arriving after the capture
+      // budget must not capture and receive a fresh advance window.
+      if (performance.now() > deadline) return finish(video, null)
+      const replaced = video !== null && (previousElement ? video !== previousElement && !previousElement.isConnected : true)
+      if (!state && replaced && video && video.readyState >= 2 && !video.paused && !video.seeking) {
+        if (watchSpec.kind === "advance") {
+          state = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState }
+          target = watchSpec.target === "advance" ? state.time + 0.5 : watchSpec.target
+        } else if (video.currentTime >= watchSpec.minTime) {
+          state = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState }
+          target = state.time + watchSpec.advanceBy
+          deadline = performance.now() + watchSpec.advanceWindowMs
+        }
+      }
+      if (state && video && video.currentTime > target) return finish(video, video.currentTime)
+      frame = requestAnimationFrame(tick)
+    }
+    tick()
+  }, { watchSpec: spec, previousElement: previous, token: id })
+  return { id }
+}
+
+async function playbackWatchResult(page: Page, handle: PlaybackWatchHandle): Promise<PlaybackObservation | null> {
+  return page.evaluate((token) => {
+    type State = { time: number; rate: number; paused: boolean; readyState: number }
+    const scope = window as Window & { __dvfsPlaybackWatch?: { token: string; result: Promise<{ state: State; advanced: number | null } | null> } }
+    if (scope.__dvfsPlaybackWatch?.token !== token) return null
+    return scope.__dvfsPlaybackWatch.result
+  }, handle.id)
+}
+
+async function cancelPlaybackWatch(page: Page, handle: PlaybackWatchHandle): Promise<void> {
+  await page.evaluate((token) => {
+    const scope = window as Window & { __dvfsPlaybackWatch?: { token: string; stop: () => void } }
+    if (scope.__dvfsPlaybackWatch?.token !== token) return
+    scope.__dvfsPlaybackWatch.stop()
+    delete scope.__dvfsPlaybackWatch
+  }, handle.id)
+}
+
+async function holdPlayback(page: Page) {
+  return page.locator("video").evaluate((v: HTMLVideoElement) => {
+    const wasPlaying = !v.paused && !v.ended
+    v.pause()
+    return { wasPlaying, time: v.currentTime, rate: v.playbackRate }
+  })
 }
 
 async function ready(page: Page) {
@@ -28,13 +154,8 @@ async function ready(page: Page) {
 }
 
 async function convert(page: Page) {
-  await page.getByRole("button", { name: "Settings", exact: true }).click()
-  await page.getByRole("menuitem", { name: /화질/ }).click()
+  await openSubmenu(page, /화질/)
   const choice = page.getByRole("menuitemradio", { name: /변환 재생/ })
-  const menu = page.getByRole("menu").filter({ has: choice })
-  await expect(menu).toBeVisible()
-  await expect(menu).not.toHaveAttribute("data-starting-style", "")
-  await settleSubmenu(page, menu)
   const [response] = await Promise.all([
     page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === "/api/media/hls"),
     choice.click(),
@@ -95,8 +216,16 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     await ready(page)
     await convert(page)
 
-    await page.locator("video").evaluate(async (v: HTMLVideoElement) => { v.currentTime = 200; await v.play() })
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(201)
+    const advanceWatch = await installPlaybackWatch(page, { kind: "advance", position: 200, target: 201, deadlineMs: 15_000 })
+    let ahead: PlaybackObservation | null = null
+    try {
+      ahead = await playbackWatchResult(page, advanceWatch)
+    } finally {
+      await cancelPlaybackWatch(page, advanceWatch).catch(() => {})
+    }
+    expect(ahead).not.toBeNull()
+    if (!ahead?.advanced) throw new Error("playback did not advance past 201 within 15 s")
+    expect(ahead.advanced).toBeGreaterThan(201)
     await page.reload()
     await ready(page)
     await convert(page)
@@ -151,57 +280,31 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     healthy = true
     const old = await page.locator("video").elementHandle()
     if (!old) throw new Error("the video element was replaced before the retry")
-    // The recovered element keeps playing while Playwright waits. On a slow runner a round trip
-    // can take longer than the restored position's remaining window, so the file ends and
-    // auto-next leaves the page before an external poll can sample it. Observe the resume, its
-    // actual advance and the pause inside the page, then assert on that one captured state.
-    const resumed = playing
-      ? page.evaluate((previous: Element) => new Promise<RecoveryObservation | null>(resolve => {
-          const state = window as Window & { __dvfsRecoveryCancelled?: boolean }
-          const deadline = performance.now() + 30_000
-          let restored: RecoveryState | null = null
-          let advanceDeadline = 0
-          const finish = (advanced: number | null) => {
-            const video = document.querySelector("video")
-            video?.pause()
-            resolve(restored ? { restored, advanced, pausedAfter: video?.paused ?? false } : null)
-          }
-          const tick = () => {
-            if (state.__dvfsRecoveryCancelled) return resolve(null)
-            const video = document.querySelector("video")
-            if (!restored && video && video !== previous && !previous.isConnected && video.readyState >= 2 && video.currentTime >= 199.5 && !video.paused && !video.seeking) {
-              restored = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState }
-              advanceDeadline = performance.now() + 15_000
-            }
-            if (restored && video) {
-              if (video.currentTime > restored.time + 0.5) return finish(video.currentTime)
-              if (performance.now() > advanceDeadline) return finish(null)
-            }
-            if (performance.now() > deadline) return resolve(null)
-            requestAnimationFrame(tick)
-          }
-          tick()
-        }), old)
-      : null
+    let recoveryWatch: PlaybackWatchHandle | null = null
     try {
+      // Install the observation before the retry input: if the click's response is slow, the
+      // replacement can otherwise resume, advance and auto-next before an observation installed
+      // after the click returns exists.
+      recoveryWatch = playing
+        ? await installPlaybackWatch(page, { kind: "recovery", minTime: 199.5, advanceBy: 0.5, captureDeadlineMs: 30_000, advanceWindowMs: 15_000 }, old)
+        : null
       await retry.click()
+      const observed = recoveryWatch ? await playbackWatchResult(page, recoveryWatch) : null
       await expect.poll(() => old.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
       await expect(dialog).not.toBeVisible()
       await expect(retry).not.toBeVisible()
       await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
       if (playing) {
-        if (!resumed) throw new Error("the playing observation was not started")
-        const observed = await resumed
         expect(observed).not.toBeNull()
         if (!observed) throw new Error("playback did not resume after the manual retry")
-        expect(observed.restored.readyState).toBeGreaterThanOrEqual(2)
-        expect(observed.restored.rate).toBe(1.75)
-        expect(observed.restored.paused).toBe(false)
-        expect(observed.restored.time).toBeGreaterThanOrEqual(199.5)
-        expect(observed.restored.time).toBeLessThan(210)
+        expect(observed.state.readyState).toBeGreaterThanOrEqual(2)
+        expect(observed.state.rate).toBe(1.75)
+        expect(observed.state.paused).toBe(false)
+        expect(observed.state.time).toBeGreaterThanOrEqual(199.5)
+        expect(observed.state.time).toBeLessThan(210)
         expect(observed.advanced).not.toBeNull()
-        expect(observed.advanced ?? Number.NEGATIVE_INFINITY).toBeGreaterThan(observed.restored.time + 0.5)
-        expect(observed.pausedAfter).toBe(true)
+        expect(observed.advanced ?? Number.NEGATIVE_INFINITY).toBeGreaterThan(observed.state.time + 0.5)
+        await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
       } else {
         await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
         await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.75)
@@ -211,11 +314,7 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
       await expect(page).toHaveURL(/\/demo\.mp4$/)
       if (fullscreen) await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
     } finally {
-      if (resumed) {
-        void page.evaluate(() => {
-          (window as Window & { __dvfsRecoveryCancelled?: boolean }).__dvfsRecoveryCancelled = true
-        }).catch(() => {})
-      }
+      if (recoveryWatch) await cancelPlaybackWatch(page, recoveryWatch).catch(() => {})
     }
   })
 }
@@ -248,12 +347,8 @@ test("returning to a cached HLS source clears the previous terminal failure", as
   await page.keyboard.press("Escape")
 
   for (const name of [/^원본/, /변환 재생/]) {
-    await page.getByRole("button", { name: "Settings", exact: true }).click()
-    await page.getByRole("menuitem", { name: /화질/ }).click()
+    await openSubmenu(page, /화질/)
     const choice = page.getByRole("menuitemradio", { name })
-    const menu = page.getByRole("menu").filter({ has: choice })
-    await expect(menu).toBeVisible()
-    await expect(menu).not.toHaveAttribute("data-starting-style", "")
     const old = await page.locator("video").elementHandle()
     await choice.click()
     await page.keyboard.press("Escape")
@@ -308,8 +403,7 @@ test("VR renders current decoded frames after conversion, HLS recovery and a fre
     }
   })
   await ready(page)
-  await page.getByRole("button", { name: "Settings", exact: true }).click()
-  await page.getByRole("menuitem", { name: "VR 일반 영상" }).click()
+  await openSubmenu(page, "VR 일반 영상")
   await page.getByRole("menuitemradio", { name: "360°단일", exact: true }).click()
   await page.keyboard.press("Escape")
   await expect(page.locator("[data-vr] canvas")).toBeVisible()
@@ -336,8 +430,14 @@ test("VR renders current decoded frames after conversion, HLS recovery and a fre
   await expect(page.locator("video")).toHaveAttribute("data-vr-upload", "true")
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => Number(v.dataset.vrFrames ?? 0))).toBeGreaterThan(1)
 
-  await page.getByRole("button", { name: "Settings", exact: true }).click()
-  await page.getByRole("menuitem", { name: /화질/ }).click()
+  // The recovered frames above are the playback assertion. The source switch below checks source
+  // identity and rendering, not playing, so freeze the restored position before the menu sequence:
+  // on a slow runner the remaining 40 s otherwise plays out and auto-next changes the page under
+  // the assertions. The VR view still renders loadeddata/seeked frames while paused.
+  const held = await holdPlayback(page)
+  await test.info().attach("vr-hold", { body: JSON.stringify(held), contentType: "application/json" })
+
+  await openSubmenu(page, /화질/)
   await page.getByRole("menuitemradio", { name: /^원본/ }).click()
   await page.keyboard.press("Escape")
   await expect(page.locator("video")).toHaveAttribute("src", /api\/fs\/raw/)
@@ -462,8 +562,7 @@ test("an old HLS recovery response cannot remount the user's new original source
   try {
     await page.locator("video").evaluate((v: HTMLVideoElement) => { v.currentTime = 200 })
     await expect.poll(() => pending).toBe(true)
-    await page.getByRole("button", { name: "Settings", exact: true }).click()
-    await page.getByRole("menuitem", { name: /화질/ }).click()
+    await openSubmenu(page, /화질/)
     await page.getByRole("menuitemradio", { name: /^원본/ }).click()
     await page.keyboard.press("Escape")
     await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentSrc.includes("/api/fs/raw"))).toBe(true)
@@ -488,13 +587,8 @@ test("conversion retains the selected playback rate, pause and position", async 
   await ready(page)
   await page.locator("video").evaluate((v: HTMLVideoElement) => { v.pause(); v.currentTime = 12.5 })
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeCloseTo(12.5)
-  await page.getByRole("button", { name: "Settings", exact: true }).click()
-  await page.getByRole("menuitem", { name: /Speed/ }).click()
-  const rate = page.getByRole("menuitemradio", { name: "1.7×", exact: true })
-  const menu = page.getByRole("menu").filter({ has: rate })
-  await expect(menu).toBeVisible()
-  await expect(menu).not.toHaveAttribute("data-starting-style", "")
-  await rate.click()
+  await openSubmenu(page, /Speed/)
+  await page.getByRole("menuitemradio", { name: "1.7×", exact: true }).click()
   await page.keyboard.press("Escape")
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.7)
   await convert(page)
