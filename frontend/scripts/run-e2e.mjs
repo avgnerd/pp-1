@@ -1,9 +1,9 @@
 // Runs each owned Playwright config in order and stops at the first failure, so the exit code is
 // Playwright's. Each config owns its spec files and fixture servers.
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdtempSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const root = fileURLToPath(new URL("..", import.meta.url))
@@ -23,7 +23,15 @@ if (!cli) {
   process.exit(1)
 }
 
-const artifacts = mkdtempSync(join(tmpdir(), "dvfs-e2e-run-"))
+// CI sets DVFS_E2E_ARTIFACTS so every report and trace lands in one directory it can upload.
+const artifactsOverride = process.env.DVFS_E2E_ARTIFACTS
+let artifacts
+if (artifactsOverride) {
+  artifacts = resolve(artifactsOverride)
+  mkdirSync(artifacts, { recursive: true })
+} else {
+  artifacts = mkdtempSync(join(tmpdir(), "dvfs-e2e-run-"))
+}
 const dataDir = mkdtempSync(join(tmpdir(), "dvfs-e2e-data-"))
 if (!existsSync(join(root, "..", "backend", "internal", "web", "dist", "index.html"))) {
   console.warn("warning: backend/internal/web/dist/index.html is missing; the smoke config serves the")
@@ -59,11 +67,10 @@ for (const config of configs) {
     PLAYWRIGHT_JSON_OUTPUT_FILE: jsonFile,
     DVFS_E2E_DATA: dataDir,
   }
-  const result = spawnSync(
-    process.execPath,
-    [cli, "test", `--config=${join(root, config.file)}`, "--reporter=list,html,json"],
-    { cwd: root, env, stdio: "inherit" },
-  )
+  const args = [cli, "test", `--config=${join(root, config.file)}`, "--reporter=list,html,json"]
+  // The default trace location stays test-results; CI keeps traces next to the reports.
+  if (artifactsOverride) args.push("--output", join(artifacts, `results-${config.key}`))
+  const result = spawnSync(process.execPath, args, { cwd: root, env, stdio: "inherit" })
   const status = result.status ?? 1
   const summary = countSpecs(jsonFile)
   if (summary) {
@@ -100,5 +107,5 @@ console.log(
   `\nall ${configs.length} configs passed: ${totals.expected} passed, ${totals.unexpected} failed, ` +
     `${totals.skipped} skipped, ${totals.flaky} flaky across ${totals.files} spec files`,
 )
-console.log(`html reports and json reports: ${artifacts}`)
+console.log(`html reports, json reports, and traces: ${artifacts}`)
 console.log(`server data written to: ${dataDir}`)

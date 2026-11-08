@@ -392,7 +392,10 @@ test("an old HLS recovery response cannot remount the user's new original source
     await page.getByRole("menuitemradio", { name: /^원본/ }).click()
     await page.keyboard.press("Escape")
     await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentSrc.includes("/api/fs/raw"))).toBe(true)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
+    // The replacement restores the pre-switch position from its loadedmetadata handler, and that event
+    // is a queued task: readyState can already be HAVE_CURRENT_DATA before the handler runs and writes
+    // the position back. Wait for the restore itself before seeking.
+    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThanOrEqual(199.5)
     await page.locator("video").evaluate((v: HTMLVideoElement) => { v.pause(); v.currentTime = 55 })
     await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeCloseTo(55)
     replacement = await page.locator("video").elementHandle()

@@ -70,7 +70,9 @@ browse 설정은 Go 서버와 fake Dropbox를 띄우지 않습니다. 두 fixtur
 
 runner는 이 경로를 지우지 않습니다. 실패를 조사한 뒤 직접 정리합니다. 성공 실행도 HTML과 JSON을 남깁니다.
 
-실패한 테스트의 trace는 설정에 따라 다음에 남습니다.
+`DVFS_E2E_ARTIFACTS`를 지정하면 runner는 그 디렉터리에 리포트를 쓰고, 실패한 테스트의 trace는 `results-smoke`, `results-streaming`, `results-browse`에 남깁니다.
+
+`DVFS_E2E_ARTIFACTS`를 지정하지 않으면 실패한 테스트의 trace는 설정에 따라 다음에 남습니다.
 
 - smoke와 browse: `frontend/test-results`.
 - streaming: `$env:TEMP\dvfs-streaming-XXXX\results`. 이 디렉터리는 fixture의 영상과 HLS 파일도 담습니다.
@@ -102,3 +104,91 @@ npx playwright test --config=playwright.browse.config.ts
 ```
 
 `npm run e2e`와 직접 실행의 차이는 데이터와 리포트입니다. runner는 항상 새 임시 데이터 디렉터리를 쓰고, 세 설정을 순서대로 실행하며, HTML과 JSON 리포트를 임시 디렉터리에 모읍니다. 직접 실행은 해당 설정 하나만 실행하고, `data-playwright`를 쓰거나 HTML 리포트를 열 수 있습니다.
+
+## CI
+
+`.github/workflows/ci.yml`은 Go 빌드와 전체 테스트, 프론트 타입 검사와 빌드, Edge E2E 전체를 GitHub-hosted Windows runner에서 실행합니다. E2E 로그와 리포트는 성공과 실패 모두 아티팩트로 남깁니다.
+
+### 트리거와 권한
+
+- `pull_request`: PR이 열리거나, 갱신되거나, 다시 열릴 때 실행합니다.
+- `push`: 모든 브랜치에서 실행합니다. 저장소에 기본 원격 브랜치가 없으므로 브랜치 이름을 가정하지 않습니다.
+- `workflow_dispatch`: 수동으로 실행합니다.
+- 권한은 `contents: read`만 씁니다. secret, 배포, 쓰기 권한은 쓰지 않습니다.
+
+### 실행 환경
+
+| 항목 | 값 |
+| --- | --- |
+| runner | `windows-2025` |
+| Go | `backend/go.mod`의 `go 1.27.3` |
+| Node.js | `24` |
+| 브라우저 | 이미지에 포함된 Microsoft Edge |
+| FFmpeg | `scripts/ci/prepare-ffmpeg.ps1`이 libx264를 포함한 빌드를 준비 |
+
+`windows-2025` 이미지에는 Edge와 Node.js 24가 있고 FFmpeg는 없습니다. Go 1.27.3과 FFmpeg는 CI가 직접 준비합니다. Windows runner 라벨은 [GitHub Docs의 runner 표](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)와 [Windows2025 이미지 목록](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md)을 따릅니다.
+
+workflow는 `actions/checkout@v7`, `actions/setup-go@v7`, `actions/setup-node@v7`, `actions/upload-artifact@v7`를 씁니다.
+
+`prepare-ffmpeg.ps1`은 [BtbN FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)의 `win64-gpl` 빌드를 내려받습니다. `lgpl` 변형에는 libx264가 없고 `gpl` 변형에는 있습니다. 스크립트는 같은 릴리스의 `checksums.sha256`으로 SHA-256을 확인하고, 설치한 바이너리가 `libx264` 인코더를 보고하는지 검사합니다. 내려받는 태그는 `latest`라서 FFmpeg 버전은 실행마다 달라질 수 있습니다. 체크섬은 손상된 다운로드만 걸러 냅니다.
+
+### 실행 단계
+
+1. `scripts/ci/prepare-ffmpeg.ps1`
+2. `backend`에서 `go build ./...`, `go test ./... -count=1`
+3. `frontend`에서 `npm ci`, `npm run typecheck`, `npm run build`
+4. `scripts/ci/embed-frontend.ps1`
+5. `scripts/ci/run-e2e.ps1`이 `npm run e2e`를 실행
+
+E2E는 62개 테스트를 세 설정에서 `msedge`로 실행합니다. fake Dropbox와 실행마다 새로 만드는 임시 데이터 디렉터리를 쓰고, `data-playwright`와 실제 Dropbox 계정은 쓰지 않습니다. workflow는 `continue-on-error`와 재시도를 쓰지 않습니다. Go 미디어 테스트는 FFmpeg가 없으면 스스로 skip하므로 CI는 FFmpeg 준비를 먼저 검사합니다.
+
+helper는 호출자 경로 인자를 받지 않습니다. `embed-frontend.ps1`은 스크립트가 속한 저장소의 `frontend/dist`와 `backend/internal/web/dist`만 씁니다. `prepare-ffmpeg.ps1`은 OS 임시 디렉터리의 `dvfs-ffmpeg`만 씁니다. 두 스크립트는 reparse point를 따라가지 않습니다. `prepare-ffmpeg.ps1`은 자기가 만든 표시 파일(`.dvfs-ci-ffmpeg`)이 없는 디렉터리를 수정하지 않고 실패합니다.
+
+### 아티팩트
+
+E2E 단계는 workflow 식 `${{ runner.temp }}\dvfs-e2e-artifacts`를 `DVFS_E2E_ARTIFACTS`로 지정합니다. `run-e2e.ps1`은 이 디렉터리에 다음을 씁니다.
+
+- `e2e.log`: E2E 표준 출력과 표준 에러.
+- `smoke.json`, `streaming.json`, `browse.json`: 설정별 JSON 리포트.
+- `html-smoke`, `html-streaming`, `html-browse`: 설정별 HTML 리포트.
+- `results-smoke`, `results-streaming`, `results-browse`: 실패한 테스트의 `trace.zip`과 `error-context.md`.
+
+`Upload E2E evidence` 단계가 `if: always()`로 이 디렉터리를 `e2e-evidence` 아티팩트에 올립니다. E2E 단계가 실패해도 업로드는 실행됩니다. 보관 기간은 14일입니다. `actions/upload-artifact`는 기본으로 숨김 파일을 제외하므로 `include-hidden-files`를 켜지 않습니다.
+
+서버 임시 데이터 디렉터리(`dvfs-e2e-data-*`)는 아티팩트에 넣지 않습니다. 이 디렉터리에는 `app.db`와 `secret.key`가 생깁니다. Go와 npm 단계의 로그는 Actions 실행 로그에 남고, 아티팩트에는 넣지 않습니다.
+
+`run-e2e.ps1`은 suite를 시작하기 전에 아티팩트 디렉터리와 `e2e.log`를 만들 수 있는지 확인합니다. 기록할 수 없으면 suite를 실행하지 않고 0이 아닌 코드로 끝납니다.
+
+### 로컬에서 CI 단계 재현
+
+```powershell
+./scripts/ci/prepare-ffmpeg.ps1
+
+cd backend
+go build ./...
+go test ./... -count=1
+
+cd ..\frontend
+npm ci
+npm run typecheck
+npm run build
+
+cd ..
+./scripts/ci/embed-frontend.ps1
+$env:DVFS_E2E_ARTIFACTS = Join-Path $env:TEMP ("dvfs-e2e-" + [guid]::NewGuid().ToString("N"))
+./scripts/ci/run-e2e.ps1
+```
+
+`run-e2e.ps1`은 `npm run e2e`의 종료 코드를 그대로 돌려줍니다. `DVFS_E2E_ARTIFACTS`를 지정하지 않으면 `%TEMP%\dvfs-e2e-<guid>`를 씁니다. `npm run e2e`의 기본 동작은 바뀌지 않습니다.
+
+`%TEMP%\dvfs-ffmpeg`가 남아 있는데 표시 파일 `.dvfs-ci-ffmpeg`가 없으면 `prepare-ffmpeg.ps1`이 실패합니다. 그 디렉터리가 이 스크립트의 설치가 아니면 직접 확인해 지운 뒤 다시 실행합니다.
+
+workflow YAML은 actionlint로 검사합니다.
+
+```powershell
+actionlint .github/workflows/ci.yml
+```
+
+### 원격 미검증
+
+저장소에 Git remote가 없어 이 workflow는 GitHub에서 실행된 적이 없습니다. 로컬에서 같은 명령과 YAML lint만 확인했습니다. GitHub-hosted runner의 실제 실행, 아티팩트 업로드, Edge와 FFmpeg 설치는 원격 실행 뒤에 확인해야 합니다.
