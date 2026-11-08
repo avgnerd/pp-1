@@ -590,6 +590,11 @@ test("VR renders current decoded frames after conversion, HLS recovery and a fre
     }
   })
   await ready(page)
+  // The initial demo can already be playing; ready alone does not mean paused. Establish the
+  // paused precondition explicitly and keep the observed initial state in the attachment.
+  const heldBeforeMenu = await holdPlayback(page)
+  await test.info().attach("vr-initial-hold", { body: JSON.stringify(heldBeforeMenu), contentType: "application/json" })
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
   await openSubmenu(page, "VR 일반 영상")
   await page.getByRole("menuitemradio", { name: "360°단일", exact: true }).click()
   await page.keyboard.press("Escape")
@@ -597,6 +602,12 @@ test("VR renders current decoded frames after conversion, HLS recovery and a fre
   await page.locator("video").evaluate(async (v: HTMLVideoElement) => { await v.play() })
   await expect(page.locator("video")).toHaveAttribute("data-vr-upload", "true")
   const old = await page.locator("video").elementHandle()
+  // This is the only menu call while playing: pause explicitly as a user would so the auto-hiding
+  // controls stay reachable across the ready-to-click delay. The post-conversion play below proves
+  // the source replacement still plays.
+  const heldBeforeConvert = await holdPlayback(page)
+  await test.info().attach("vr-before-convert-hold", { body: JSON.stringify(heldBeforeConvert), contentType: "application/json" })
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
   await convert(page)
   await expect.poll(() => old?.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
   await page.locator("video").evaluate(async (v: HTMLVideoElement) => { await v.play() })
