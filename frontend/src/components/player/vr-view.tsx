@@ -58,6 +58,19 @@ export function VRView({ video, projection, stereo }: Props) {
 
       let lon = 0
       let lat = 0
+      // Skip repainting a paused, untouched video; on software-rendered machines that work starves
+      // the page. Playback, camera input, layout changes and decoded frames mark the scene dirty.
+      const frameDriven = "requestVideoFrameCallback" in video
+      let dirty = true
+      let frameRequest: number | undefined
+      const watchFrames = () => {
+        if (!frameDriven) return
+        frameRequest = video.requestVideoFrameCallback(() => {
+          dirty = true
+          watchFrames()
+        })
+      }
+      watchFrames()
       const maxLon = projection === "180" ? 85 : Infinity
       const clamp = () => {
         lat = Math.max(-85, Math.min(85, lat))
@@ -69,6 +82,7 @@ export function VRView({ video, projection, stereo }: Props) {
         renderer.setSize(w, h, false)
         camera.aspect = w / h
         camera.updateProjectionMatrix()
+        dirty = true
       }
       const ro = new ResizeObserver(resize)
       ro.observe(host)
@@ -86,6 +100,7 @@ export function VRView({ video, projection, stereo }: Props) {
         lon = drag.lon - (e.clientX - drag.x) * k
         lat = drag.lat + (e.clientY - drag.y) * k
         clamp()
+        dirty = true
       }
       const onUp = (e: PointerEvent) => {
         if (drag?.id === e.pointerId) drag = null
@@ -95,6 +110,7 @@ export function VRView({ video, projection, stereo }: Props) {
         e.stopPropagation()
         camera.fov = Math.max(25, Math.min(110, camera.fov + Math.sign(e.deltaY) * 4))
         camera.updateProjectionMatrix()
+        dirty = true
       }
       const onKey = (e: KeyboardEvent) => {
         const step = 5
@@ -109,6 +125,7 @@ export function VRView({ video, projection, stereo }: Props) {
         e.stopPropagation()
         clamp()
         camera.updateProjectionMatrix()
+        dirty = true
       }
       el.addEventListener("pointerdown", onDown)
       el.addEventListener("pointermove", onMove)
@@ -119,6 +136,9 @@ export function VRView({ video, projection, stereo }: Props) {
 
       const target = new THREE.Vector3()
       renderer.setAnimationLoop(() => {
+        // Without frame callbacks a paused seek has no invalidation signal, so keep repainting.
+        if (!dirty && video.paused && frameDriven) return
+        dirty = false
         const phi = THREE.MathUtils.degToRad(90 - lat)
         const theta = THREE.MathUtils.degToRad(lon - 90)
         target.set(Math.sin(phi) * Math.cos(theta), Math.cos(phi), Math.sin(phi) * Math.sin(theta))
@@ -133,6 +153,7 @@ export function VRView({ video, projection, stereo }: Props) {
 
       cleanup = () => {
         renderer.setAnimationLoop(null)
+        if (frameRequest !== undefined) video.cancelVideoFrameCallback(frameRequest)
         ro.disconnect()
         el.removeEventListener("pointerdown", onDown)
         el.removeEventListener("pointermove", onMove)

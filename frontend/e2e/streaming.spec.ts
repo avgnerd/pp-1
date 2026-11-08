@@ -1,4 +1,22 @@
-import { expect, test, type Page } from "@playwright/test"
+import { expect, test, type Locator, type Page } from "@playwright/test"
+
+// Base UI focuses a submenu one task after it opens and the browser scrolls the page to reveal
+// the focused item. The popover is anchored to the controls, so that scroll moves it under the
+// pointer: a click sent before the scroll finishes presses the old screen position.
+async function settleSubmenu(page: Page, menu: Locator) {
+  await expect.poll(() => menu.evaluate(node => node.contains(document.activeElement))).toBe(true)
+  await page.evaluate(() => new Promise<void>(resolve => {
+    let last = window.scrollY
+    let stable = 0
+    const tick = () => {
+      if (window.scrollY === last) stable++
+      else { stable = 0; last = window.scrollY }
+      if (stable >= 2) resolve()
+      else requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  }))
+}
 
 async function ready(page: Page) {
   await page.goto("/demo.mp4")
@@ -13,6 +31,7 @@ async function convert(page: Page) {
   const menu = page.getByRole("menu").filter({ has: choice })
   await expect(menu).toBeVisible()
   await expect(menu).not.toHaveAttribute("data-starting-style", "")
+  await settleSubmenu(page, menu)
   const [response] = await Promise.all([
     page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === "/api/media/hls"),
     choice.click(),
@@ -128,18 +147,49 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     await expect(retry).toBeVisible()
     healthy = true
     const old = await page.locator("video").elementHandle()
+    if (!old) throw new Error("the video element was replaced before the retry")
+    // The recovered element keeps playing while Playwright polls, so on a slow runner the file
+    // plays out and auto-next leaves the page before the position assertions run. Capture and
+    // pause at the instant playback resumes, then resume to prove it still advances.
+    const resumed = playing
+      ? page.evaluate((previous: Element) => new Promise<{ time: number; rate: number; paused: boolean; readyState: number } | null>(resolve => {
+          const deadline = performance.now() + 30_000
+          const tick = () => {
+            const video = document.querySelector("video")
+            if (video && video !== previous && !previous.isConnected && video.readyState >= 2 && video.currentTime >= 199.5 && !video.paused && !video.seeking) {
+              const state = { time: video.currentTime, rate: video.playbackRate, paused: video.paused, readyState: video.readyState }
+              video.pause()
+              resolve(state)
+              return
+            }
+            if (performance.now() > deadline) resolve(null)
+            else requestAnimationFrame(tick)
+          }
+          tick()
+        }), old)
+      : null
     await retry.click()
-    await expect.poll(() => old?.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
+    await expect.poll(() => old.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
     await expect(dialog).not.toBeVisible()
     await expect(retry).not.toBeVisible()
     await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(!playing)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.75)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThanOrEqual(199.5)
-    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeLessThan(210)
     if (playing) {
-      const position = await page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)
-      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(position + 0.5)
+      const restored = await resumed
+      expect(restored).not.toBeNull()
+      if (!restored) throw new Error("playback did not resume after the manual retry")
+      expect(restored.readyState).toBeGreaterThanOrEqual(2)
+      expect(restored.rate).toBe(1.75)
+      expect(restored.paused).toBe(false)
+      expect(restored.time).toBeGreaterThanOrEqual(199.5)
+      expect(restored.time).toBeLessThan(210)
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
+      await page.locator("video").evaluate(async (v: HTMLVideoElement) => { await v.play() })
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(restored.time + 0.5)
+    } else {
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.75)
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThanOrEqual(199.5)
+      await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeLessThan(210)
     }
     if (fullscreen) await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
   })
