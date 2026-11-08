@@ -181,3 +181,32 @@ If a semantic tool returns nothing, do **not** silently fall back to grep:
 
 Only after these checks fail should you fall back to manual `Read` of the
 relevant file — and only as diagnosis, not as a substitute capability.
+
+
+## 개발 도구 문제 해결
+
+이 절은 개발 중에 만나는 도구 문제와 복구 방법을 다룹니다. 제품 동작과는 관계없습니다.
+
+### Orca에서 DSH 작업이 시작되지 않을 때
+
+DSH 시작 화면에 Orca 알림이 draft로 남고 `activity=done`, `stage=input_accepted`이면 작업이 아직 시작되지 않은 상태입니다. `stage` 값만 보고 제출이 끝났다고 판단하지 마세요.
+
+1. `orca orchestration worker-show --dispatch <dispatch_id>`로 dispatch 상태를 확인합니다.
+2. `orca orchestration worker-read --dispatch <dispatch_id>`로 현재 출력과 draft를 확인합니다.
+3. draft가 남아 있고 실제 작업이 시작되지 않았을 때만 Enter를 한 번 보냅니다. 사용자가 제출을 승인했는지 먼저 확인합니다.
+
+자동으로 보낼 때는 정확한 terminal handle과 현재 draft를 확인한 뒤 다음 명령을 실행합니다.
+
+```powershell
+orca terminal send --terminal <handle> --text ([string][char]13) --json
+```
+
+`accepted=true`와 `bytesWritten=1`은 입력을 받았다는 뜻일 뿐입니다. 대화에 원래 작업 프롬프트가 나타나고 `activity=working`이 되는지 확인하세요. `stage=input_accepted`는 그대로 남을 수 있습니다. `--wait-submit`은 관찰만 하고 제출을 대신하지 않습니다. 빈 `--text` 값과 `--enter`를 함께 보내면 `invalid_argument`로 실패하므로 빈 `--text` 값을 전달하지 마세요.
+
+실행 중인 터미널에 Enter를 다시 보내거나 같은 프롬프트를 중복 입력하거나 worker를 추가로 만들지 마세요. 원인은 Orca/DSH의 입력 제출 자동화 결함으로 의심되지만 영구 수정이 확인된 것은 아닙니다. Orca나 DSH를 업데이트한 뒤에도 같은 증상이 남으면 위 절차로 제출한 뒤 대화와 활동 상태를 다시 확인하세요.
+
+### 그 밖의 개발 도구 증상
+
+에이전트가 DSML 태그를 본문으로 출력하면 실제 셸 도구에는 짧은 명령을 하나씩 전달합니다. 절차가 길면 OS 임시 폴더의 `.ps1` 파일로 분리해 실행합니다.
+
+`503 model_routing_unavailable`은 외부 모델 라우팅 오류입니다. 승인 없이 다른 모델로 바꾸지 마세요. 먼저 `orca orchestration task-list`로 Task 상태를 확인한 뒤, `ready`이면 같은 Task를 `worker-start --task <task_id>`로 시작하고 `--retry-of`를 넣지 않으며, `failed` 또는 `blocked`이면 마지막 settled Dispatch만 `--task <task_id> --retry-of <dispatch_id>`로 재시도하고 현재 Orca help와 recovery 안내에 맞춰 배치, agent, terminal 선택을 다시 지정합니다. `task_not_startable`은 503과 다른 Task 상태 불일치이므로 상태를 먼저 바로잡고, 사용자 승인 없이 재시도하거나 모델을 임의로 바꾸거나 같은 Task를 중복 시작하지 마세요
