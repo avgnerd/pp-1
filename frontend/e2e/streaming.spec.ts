@@ -1007,6 +1007,8 @@ for (const layout of [
     await Promise.all(surfaces.map(settleControlTransition))
     for (const surface of await Promise.all(surfaces.map(readControlSurface))) expectSurfaceHidden(surface)
 
+    await holdPlayback(page)
+    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
     await player.hover()
     await page.getByRole("button", { name: /Show duration/ }).click()
     const pointerFocus = await page.evaluate(() => ({
@@ -1014,6 +1016,14 @@ for (const layout of [
       focusVisible: document.activeElement?.matches(":focus-visible") ?? false,
     }))
     expect(pointerFocus).toEqual({ tag: "TIME", focusVisible: false })
+    const resumedAt = await page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)
+    await page.locator("video").evaluate(async (v: HTMLVideoElement) => { await v.play() })
+    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(false)
+    await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(resumedAt + 0.2)
+    expect(await page.evaluate(() => ({
+      tag: document.activeElement?.tagName,
+      focusVisible: document.activeElement?.matches(":focus-visible") ?? false,
+    }))).toEqual({ tag: "TIME", focusVisible: false })
     await waitForControlsIdle(page)
     await Promise.all(surfaces.map(settleControlTransition))
     for (const surface of await Promise.all(surfaces.map(readControlSurface))) expectSurfaceHidden(surface)
