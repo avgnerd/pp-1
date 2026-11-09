@@ -43,10 +43,10 @@ export function DefaultVideoControls({ renderThumbnail }: DefaultVideoControlsPr
           'media-lg:bg-media-popover media-lg:text-media-popover-foreground',
           'media-lg:surface-media media-lg:after:surface-media-inset',
           'media-2xl:inset-x-3 media-2xl:bottom-3',
-          'media-lg:not-data-visible:pointer-events-none media-lg:not-data-visible:opacity-0',
-          'media-lg:not-data-visible:scale-media-hidden media-lg:not-data-visible:translate-y-media-hidden-offset',
-          'media-lg:pointer-fine:not-data-visible:blur-media-hidden',
-          'media-lg:not-data-visible:duration-media-controls'
+          'media-lg:not-data-visible:not-has-focus-visible:pointer-events-none media-lg:not-data-visible:not-has-focus-visible:opacity-0',
+          'media-lg:not-data-visible:not-has-focus-visible:scale-media-hidden media-lg:not-data-visible:not-has-focus-visible:translate-y-media-hidden-offset',
+          'media-lg:pointer-fine:not-data-visible:not-has-focus-visible:blur-media-hidden',
+          'media-lg:not-data-visible:not-has-focus-visible:duration-media-controls'
         )}
       >
         <Tooltip.Provider>
@@ -56,13 +56,13 @@ export function DefaultVideoControls({ renderThumbnail }: DefaultVideoControlsPr
               'media-max-lg:bg-media-popover media-max-lg:text-media-popover-foreground',
               'media-max-lg:surface-media media-max-lg:after:surface-media-inset',
               'media-lg:contents',
-              'media-max-lg:group-[:not([data-visible])]/controls:pointer-events-none',
-              'media-max-lg:group-[:not([data-visible])]/controls:opacity-0',
-              'media-max-lg:group-[:not([data-visible])]/controls:scale-media-hidden',
-              'media-max-lg:pointer-fine:group-[:not([data-visible])]/controls:blur-media-hidden',
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:pointer-events-none',
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:opacity-0',
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:scale-media-hidden',
+              'media-max-lg:pointer-fine:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:blur-media-hidden',
               'transition-[filter,opacity,scale,translate] duration-media-controls-enter ease-out',
-              'media-max-lg:group-[:not([data-visible])]/controls:duration-media-controls',
-              'media-max-lg:group-[:not([data-visible])]/controls:translate-y-media-hidden-offset'
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:duration-media-controls',
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:translate-y-media-hidden-offset'
             )}
           >
             {slots.beforePlay}
@@ -110,13 +110,13 @@ export function DefaultVideoControls({ renderThumbnail }: DefaultVideoControlsPr
               'media-max-lg:bg-media-popover media-max-lg:text-media-popover-foreground',
               'media-max-lg:surface-media media-max-lg:after:surface-media-inset',
               'media-lg:static media-lg:p-0',
-              'media-max-lg:group-[:not([data-visible])]/controls:pointer-events-none',
-              'media-max-lg:group-[:not([data-visible])]/controls:opacity-0',
-              'media-max-lg:group-[:not([data-visible])]/controls:scale-media-hidden',
-              'media-max-lg:pointer-fine:group-[:not([data-visible])]/controls:blur-media-hidden',
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:pointer-events-none',
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:opacity-0',
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:scale-media-hidden',
+              'media-max-lg:pointer-fine:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:blur-media-hidden',
               'transition-[filter,opacity,scale,translate] duration-media-controls-enter ease-out',
-              'media-max-lg:group-[:not([data-visible])]/controls:duration-media-controls',
-              'media-max-lg:group-[:not([data-visible])]/controls:-translate-y-media-hidden-offset'
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:duration-media-controls',
+              'media-max-lg:group-[:not([data-visible]):not(:has(:focus-visible))]/controls:-translate-y-media-hidden-offset'
             )}
           >
             <ButtonTooltip side="top">

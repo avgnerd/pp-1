@@ -856,6 +856,179 @@ test("a natural HLS end still advances to the next file", async ({ page }) => {
   await expect(page).toHaveURL(/\/next\.mp4$/)
 })
 
+type ControlSurface = Awaited<ReturnType<typeof readControlSurface>>
+
+async function readControlSurface(target: Locator) {
+  return target.evaluate(element => {
+    const css = getComputedStyle(element)
+    const rect = element.getBoundingClientRect()
+    return {
+      opacity: Number(css.opacity),
+      pointerEvents: css.pointerEvents,
+      filter: css.filter,
+      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    }
+  })
+}
+
+async function readFocusRing(target: Locator) {
+  return target.evaluate(element => {
+    const css = getComputedStyle(element)
+    return {
+      visible: element.matches(":focus-visible"),
+      style: css.outlineStyle,
+      width: parseFloat(css.outlineWidth),
+      color: css.outlineColor,
+    }
+  })
+}
+
+// A hidden control surface transitions opacity, translate, scale and filter. Reading computed styles
+// in the same frame the vis idle flag drops still shows the visible values, so wait for the
+// element's own CSS transitions to finish (or stay absent for several frames when the focused
+// surface never starts one). This is event driven, not a fixed sleep.
+async function settleControlTransition(target: Locator) {
+  await target.evaluate(async element => {
+    for (let round = 0; round < 30; round++) {
+      const running = element.getAnimations()
+      if (running.length > 0) {
+        await Promise.all(running.map(animation => animation.finished.catch(() => {})))
+        continue
+      }
+      let quiet = 0
+      for (let frame = 0; frame < 3; frame++) {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+        if (element.getAnimations().length === 0) quiet++
+        else break
+      }
+      if (quiet === 3) return
+    }
+    throw new Error("media control transition did not settle")
+  })
+}
+
+async function tabUntilFocused(page: Page, target: Locator, limit = 50) {
+  for (let presses = 0; presses < limit; presses++) {
+    if (await target.evaluate(element => element === document.activeElement)) return presses
+    await page.keyboard.press("Tab")
+  }
+  throw new Error("real Tab input did not reach the target control")
+}
+
+async function waitForControlsIdle(page: Page) {
+  const player = page.getByRole("group", { name: "Media player" })
+  await expect.poll(() => player.evaluate(element => element.hasAttribute("data-controls-visible"))).toBe(true)
+  await expect.poll(() => player.evaluate(element => element.hasAttribute("data-controls-visible")), { timeout: 10_000 }).toBe(false)
+}
+
+function expectKeyboardFocus(ring: Awaited<ReturnType<typeof readFocusRing>>) {
+  expect(ring.visible).toBe(true)
+  expect(ring.style).toBe("solid")
+  expect(ring.width).toBeGreaterThanOrEqual(2)
+  expect(ring.color).not.toBe("rgba(0, 0, 0, 0)")
+}
+
+function expectSurfaceRetained(surface: ControlSurface, visible: ControlSurface) {
+  expect(surface.opacity).toBeGreaterThan(0.99)
+  expect(surface.pointerEvents).toBe("auto")
+  expect(surface.filter === "none" || surface.filter === "blur(0px)").toBe(true)
+  expect(Math.abs(surface.rect.width - visible.rect.width)).toBeLessThanOrEqual(1)
+  expect(Math.abs(surface.rect.height - visible.rect.height)).toBeLessThanOrEqual(1)
+  expect(Math.abs(surface.rect.x - visible.rect.x)).toBeLessThanOrEqual(1)
+  expect(Math.abs(surface.rect.y - visible.rect.y)).toBeLessThanOrEqual(1)
+}
+
+function expectSurfaceHidden(surface: ControlSurface) {
+  expect(surface.opacity).toBeLessThan(0.01)
+  expect(surface.pointerEvents).toBe("none")
+}
+
+for (const layout of [
+  { name: "wide", viewport: { width: 1440, height: 900 }, compact: false },
+  { name: "compact", viewport: { width: 520, height: 900 }, compact: true },
+]) {
+  test(`${layout.name} keyboard focus keeps media controls usable through idle and releases after focus leaves`, async ({ page }) => {
+    await page.setViewportSize(layout.viewport)
+    await ready(page)
+    const player = page.getByRole("group", { name: "Media player" })
+    const content = page.locator("[data-interactive]")
+    const settings = page.getByRole("button", { name: "Settings", exact: true })
+    const fullscreen = page.getByRole("button", { name: "Enter fullscreen" })
+    const surfaces = layout.compact ? [settings.locator("xpath=.."), fullscreen.locator("xpath=..")] : [content]
+
+    await page.locator("video").evaluate(async (video: HTMLVideoElement) => {
+      video.muted = true
+      await video.play().catch(() => {})
+    })
+    await expect.poll(() => page.locator("video").evaluate((video: HTMLVideoElement) => video.paused)).toBe(false)
+    const startTime = await page.locator("video").evaluate((video: HTMLVideoElement) => video.currentTime)
+    await expect.poll(() => page.locator("video").evaluate((video: HTMLVideoElement) => video.currentTime)).toBeGreaterThan(startTime + 0.2)
+
+    const containerWidth = await player.evaluate(element => element.getBoundingClientRect().width)
+    if (layout.compact) expect(containerWidth).toBeLessThan(512)
+    else expect(containerWidth).toBeGreaterThanOrEqual(512)
+
+    await page.evaluate(() => document.body.focus())
+    await tabUntilFocused(page, settings)
+    await expect(settings).toBeFocused()
+    expectKeyboardFocus(await readFocusRing(settings))
+    const visible = await Promise.all(surfaces.map(readControlSurface))
+    expect(await content.evaluate(element => element.hasAttribute("data-visible"))).toBe(true)
+
+    await waitForControlsIdle(page)
+    await Promise.all(surfaces.map(settleControlTransition))
+    expect(await content.evaluate(element => element.hasAttribute("data-visible"))).toBe(false)
+    expect(await settings.evaluate(element => element === document.activeElement)).toBe(true)
+    const retained = await Promise.all(surfaces.map(readControlSurface))
+    retained.forEach((surface, index) => expectSurfaceRetained(surface, visible[index]))
+    expectKeyboardFocus(await readFocusRing(settings))
+    await expect.poll(() => page.locator("video").evaluate((video: HTMLVideoElement) => video.paused)).toBe(false)
+    await expect.poll(() => page.locator("video").evaluate((video: HTMLVideoElement) => video.currentTime)).toBeGreaterThan(startTime + 0.5)
+
+    await settings.press("Enter")
+    const menu = openRootMenu(page)
+    await settleMenu(menu)
+    await expect(page.getByRole("menuitem", { name: /화질/ })).toBeVisible()
+    await page.keyboard.press("Escape")
+    await expect(menu).toBeHidden()
+    await expect(settings).toBeFocused()
+
+    for (let presses = 0; presses < 20 && await content.evaluate(element => element.contains(document.activeElement)); presses++) {
+      await page.keyboard.press("Tab")
+    }
+    expect(await content.evaluate(element => element.contains(document.activeElement))).toBe(false)
+    await waitForControlsIdle(page)
+    await Promise.all(surfaces.map(settleControlTransition))
+    for (const surface of await Promise.all(surfaces.map(readControlSurface))) expectSurfaceHidden(surface)
+
+    await player.hover()
+    await page.getByRole("button", { name: /Show duration/ }).click()
+    const pointerFocus = await page.evaluate(() => ({
+      tag: document.activeElement?.tagName,
+      focusVisible: document.activeElement?.matches(":focus-visible") ?? false,
+    }))
+    expect(pointerFocus).toEqual({ tag: "TIME", focusVisible: false })
+    await waitForControlsIdle(page)
+    await Promise.all(surfaces.map(settleControlTransition))
+    for (const surface of await Promise.all(surfaces.map(readControlSurface))) expectSurfaceHidden(surface)
+
+    if (layout.compact) {
+      await tabUntilFocused(page, fullscreen, 20)
+      await expect(fullscreen).toBeFocused()
+      expectKeyboardFocus(await readFocusRing(fullscreen))
+      await waitForControlsIdle(page)
+      await Promise.all(surfaces.map(settleControlTransition))
+      const topFocus = await Promise.all(surfaces.map(readControlSurface))
+      topFocus.forEach((surface, index) => expectSurfaceRetained(surface, visible[index]))
+      await page.keyboard.press("Tab")
+      expect(await content.evaluate(element => element.contains(document.activeElement))).toBe(false)
+      await waitForControlsIdle(page)
+      await Promise.all(surfaces.map(settleControlTransition))
+      for (const surface of await Promise.all(surfaces.map(readControlSurface))) expectSurfaceHidden(surface)
+    }
+  })
+}
+
 test("a current HLS recovery reloads an unchanged playlist while retaining pause and seek", async ({ page }) => {
   await ready(page)
   const manifestRequest = page.waitForRequest("**/media/*/index.m3u8")
