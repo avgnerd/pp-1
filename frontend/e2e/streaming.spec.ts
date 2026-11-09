@@ -975,12 +975,11 @@ for (const layout of [
     if (layout.compact) expect(containerWidth).toBeLessThan(512)
     else expect(containerWidth).toBeGreaterThanOrEqual(512)
 
-    await page.evaluate(() => document.body.focus())
     await tabUntilFocused(page, settings)
     await expect(settings).toBeFocused()
     expectKeyboardFocus(await readFocusRing(settings))
     const visible = await Promise.all(surfaces.map(readControlSurface))
-    expect(await content.evaluate(element => element.hasAttribute("data-visible"))).toBe(true)
+    visible.forEach((surface, index) => expectSurfaceRetained(surface, visible[index]))
 
     await waitForControlsIdle(page)
     await Promise.all(surfaces.map(settleControlTransition))
