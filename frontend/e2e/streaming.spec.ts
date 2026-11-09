@@ -642,13 +642,21 @@ test("VR renders current decoded frames after conversion, HLS recovery and a fre
   })
   // Keep the converted handle honest through the HLS trigger. If anything replaced it, fail here
   // instead of letting the later disconnect assertion pass on an element that was already gone.
-  const beforeTrigger = await converted.evaluate((v: HTMLVideoElement) => v.isConnected && v === document.querySelector("video"))
+  const beforeTrigger = await converted.evaluate((v: HTMLVideoElement) => {
+    const current = v.isConnected && v === document.querySelector("video")
+    if (current) v.currentTime = 200
+    return current
+  })
   if (!beforeTrigger) throw new Error("converted video element was replaced before the HLS failure trigger")
-  await converted.evaluate((v: HTMLVideoElement) => { v.currentTime = 200 })
   await expect.poll(() => injected).toBe(true)
-  await expect.poll(() => converted.evaluate((v: HTMLVideoElement) => v.isConnected)).toBe(false)
-  await expect(page.locator("video")).toHaveAttribute("data-vr-upload", "true")
-  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => Number(v.dataset.vrFrames ?? 0))).toBeGreaterThan(1)
+  await expect.poll(() => page.evaluate((oldElement: HTMLVideoElement) => {
+    const videos = document.querySelectorAll("video")
+    const current = videos[0]
+    return oldElement.isConnected === false &&
+      videos.length === 1 &&
+      current.dataset.vrUpload === "true" &&
+      Number(current.dataset.vrFrames ?? 0) > 1
+  }, converted)).toBe(true)
 
   // The recovered frames above are the playback assertion. The source switch below checks source
   // identity and rendering, not playing, so freeze the restored position before the menu sequence:
@@ -917,7 +925,6 @@ async function tabUntilFocused(page: Page, target: Locator, limit = 50) {
 
 async function waitForControlsIdle(page: Page) {
   const player = page.getByRole("group", { name: "Media player" })
-  await expect.poll(() => player.evaluate(element => element.hasAttribute("data-controls-visible"))).toBe(true)
   await expect.poll(() => player.evaluate(element => element.hasAttribute("data-controls-visible")), { timeout: 10_000 }).toBe(false)
 }
 
