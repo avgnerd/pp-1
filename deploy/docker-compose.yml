@@ -1,0 +1,34 @@
+# Portainer: Stacks > Add stack > Repository, Compose path "deploy/docker-compose.yml".
+# Data (config.json, app.db, secret.key, thumbnails) lives in the dvfs-data volume.
+services:
+  dvfs:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: dropbox-vfs:latest
+    container_name: dropbox-vfs
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DVFS_LISTEN: ":8080"
+      # Set when a domain or reverse proxy is added, e.g. https://files.example.com
+      DVFS_PUBLIC_URL: ${DVFS_PUBLIC_URL:-}
+      TZ: Asia/Seoul
+    volumes:
+      - dvfs-data:/data
+    # HLS segments are written under /data/hls; keep transcoding inside 4 OCPU.
+    deploy:
+      resources:
+        limits:
+          cpus: "3.5"
+          memory: 8g
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  dvfs-data:
