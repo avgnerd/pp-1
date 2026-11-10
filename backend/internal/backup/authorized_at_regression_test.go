@@ -24,7 +24,7 @@ func TestAuthorizedAtMillisecondRoundTripPreservesSecondFields(t *testing.T) {
 			ms, createdAt, updatedAt, id)
 	}
 
-	env, _, err := NewService(f.db, t.TempDir(), f.box, f.key).Export(context.Background(), ExportOptions{
+	env, _, err := NewService(f.db, testutil.TempDir(t), f.box, f.key).Export(context.Background(), ExportOptions{
 		Mode: ModePassword, Password: "correct horse battery",
 	})
 	if err != nil {
@@ -62,7 +62,7 @@ func TestAuthorizedAtMillisecondRoundTripPreservesSecondFields(t *testing.T) {
 func TestZeroAuthorizedAtRoundTripsAsZero(t *testing.T) {
 	f := newFixture(t)
 	f.mustExec(`UPDATE storages SET authorized_at = 0 WHERE id = 1`)
-	env, _, err := NewService(f.db, t.TempDir(), f.box, f.key).Export(context.Background(), ExportOptions{
+	env, _, err := NewService(f.db, testutil.TempDir(t), f.box, f.key).Export(context.Background(), ExportOptions{
 		Mode: ModePassword, Password: "correct horse battery",
 	})
 	if err != nil {

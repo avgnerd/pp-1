@@ -106,7 +106,7 @@ func (f *fixture) mustExec(q string, args ...any) {
 
 func (f *fixture) export(mode, password string, confirm bool) *Envelope {
 	f.t.Helper()
-	env, _, err := NewService(f.db, f.t.TempDir(), f.box, f.key).Export(context.Background(), ExportOptions{
+	env, _, err := NewService(f.db, testutil.TempDir(f.t), f.box, f.key).Export(context.Background(), ExportOptions{
 		Mode: mode, Password: password, ConfirmUnencrypted: confirm,
 	})
 	if err != nil {
@@ -139,7 +139,7 @@ func TestExportRoundTripAllModes(t *testing.T) {
 	f := newFixture(t)
 	const pw = "correct horse battery"
 	fixedNow := time.Date(2024, time.January, 2, 3, 4, 5, 0, time.UTC)
-	s := NewService(f.db, t.TempDir(), f.box, f.key)
+	s := NewService(f.db, testutil.TempDir(t), f.box, f.key)
 	s.Now = func() time.Time { return fixedNow }
 	var payloads []*Payload
 	for _, tc := range []struct {
@@ -415,7 +415,7 @@ func TestPasswordValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := NewService(f.db, t.TempDir(), f.box, f.key).Export(context.Background(), ExportOptions{
+			_, _, err := NewService(f.db, testutil.TempDir(t), f.box, f.key).Export(context.Background(), ExportOptions{
 				Mode: ModePassword, Password: tc.pass, ConfirmUnencrypted: tc.confirm,
 			})
 			if tc.wantErr {
@@ -448,7 +448,7 @@ func TestPasswordWhitespaceIsPreserved(t *testing.T) {
 
 func TestUnencryptedNeedsConfirmation(t *testing.T) {
 	f := newFixture(t)
-	_, _, err := NewService(f.db, t.TempDir(), f.box, f.key).Export(context.Background(), ExportOptions{Mode: ModeNone})
+	_, _, err := NewService(f.db, testutil.TempDir(t), f.box, f.key).Export(context.Background(), ExportOptions{Mode: ModeNone})
 	var ve *ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("err = %v, want ValidationError", err)
@@ -818,7 +818,7 @@ func TestApplyMergesDefaultSettings(t *testing.T) {
 func TestSnapshotCreateListAndPrune(t *testing.T) {
 	f := newFixture(t)
 	now := time.Date(2026, 11, 1, 3, 0, 0, 0, time.UTC)
-	svc := NewService(f.db, t.TempDir(), f.box, f.key)
+	svc := NewService(f.db, testutil.TempDir(t), f.box, f.key)
 	dir := svc.SnapshotDir()
 	svc.Snapshotter.Now = func() time.Time { return now }
 
@@ -901,7 +901,7 @@ func TestSnapshotCreateListAndPrune(t *testing.T) {
 
 func TestSnapshotOpen(t *testing.T) {
 	f := newFixture(t)
-	svc := NewService(f.db, t.TempDir(), f.box, f.key)
+	svc := NewService(f.db, testutil.TempDir(t), f.box, f.key)
 	name, err := svc.CreateSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -946,7 +946,7 @@ func TestSnapshotOpen(t *testing.T) {
 	}
 
 	// A snapshot written by another instance cannot be opened with this master key.
-	other := NewService(f.db, t.TempDir(), f.box, rawKey(200))
+	other := NewService(f.db, testutil.TempDir(t), f.box, rawKey(200))
 	other.Snapshotter.Dir = svc.Snapshotter.Dir
 	other.Snapshotter.Now = func() time.Time { return time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC) }
 	otherName, err := other.CreateSnapshot(context.Background())
