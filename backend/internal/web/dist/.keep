@@ -1,0 +1,1 @@
+The frontend build (frontend/dist) is copied here before `go build`; see scripts/run-local.ps1 and deploy/Dockerfile.

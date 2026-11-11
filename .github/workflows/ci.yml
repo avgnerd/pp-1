@@ -1,20 +1,86 @@
-# main is the default branch, and GitHub Actions only keeps a workflow registered while its file
-# exists here, so this file exists to register "CI". The real pipeline is the ci.yml on each code
-# branch, and dispatching that branch runs its file, not this one.
 name: CI
 
+# Every branch is covered by push, and pull_request covers the default activity types (opened,
+# synchronize, reopened) on the repository's default branch. No branch name is assumed.
 on:
+  pull_request:
+  push:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  placeholder:
-    name: Default branch placeholder
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+  verify:
+    name: Windows build, tests, and Edge E2E
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PLAYWRIGHT_HTML_OPEN: never
     steps:
-      - name: Explain why main has nothing to verify
-        run: echo "main has no code; run this workflow on a branch that contains the code"
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Show tool versions
+        run: |
+          go version
+          node --version
+          npm --version
+
+      - name: Install ffmpeg with libx264
+        run: ./scripts/ci/prepare-ffmpeg.ps1
+
+      - name: Build Go packages
+        working-directory: backend
+        run: go build ./...
+
+      - name: Run Go tests
+        working-directory: backend
+        run: go test ./... -count=1
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Typecheck the frontend
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Build the frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Copy the frontend into the Go embed directory
+        run: ./scripts/ci/embed-frontend.ps1
+
+      - name: Run Edge E2E
+        env:
+          DVFS_E2E_ARTIFACTS: ${{ runner.temp }}\dvfs-e2e-artifacts
+        run: ./scripts/ci/run-e2e.ps1
+
+      # The E2E step fails before this upload, so always() is what keeps the evidence.
+      - name: Upload E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-evidence
+          path: ${{ runner.temp }}\dvfs-e2e-artifacts
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 14
