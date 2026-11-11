@@ -112,7 +112,7 @@ npx playwright test --config=playwright.browse.config.ts
 ### 트리거와 권한
 
 - `pull_request`: PR이 열리거나, 갱신되거나, 다시 열릴 때 실행합니다.
-- `push`: 모든 브랜치에서 실행합니다. 저장소에 기본 원격 브랜치가 없으므로 브랜치 이름을 가정하지 않습니다.
+- `push`: `main`에서만 실행합니다. PR 브랜치는 `pull_request`가 검사하므로 push로 다시 돌리지 않습니다. PR 없는 브랜치는 `workflow_dispatch`로 수동 실행합니다.
 - `workflow_dispatch`: 수동으로 실행합니다.
 - 권한은 `contents: read`만 씁니다. secret, 배포, 쓰기 권한은 쓰지 않습니다.
 
