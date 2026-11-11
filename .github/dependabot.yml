@@ -9,3 +9,8 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+    groups:
+      gin-dependencies:
+        patterns:
+          - "github.com/gin-gonic/*"
+          - "github.com/gin-contrib/*"
