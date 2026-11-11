@@ -1,10 +1,11 @@
 name: CI
 
-# Every branch is covered by push, and pull_request covers the default activity types (opened,
-# synchronize, reopened) on the repository's default branch. No branch name is assumed.
+# Pull requests are checked by pull_request, main by push, and a branch with no pull request
+# can be run by hand through workflow_dispatch.
 on:
   pull_request:
   push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
