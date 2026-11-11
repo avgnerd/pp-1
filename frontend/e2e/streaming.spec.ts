@@ -57,9 +57,8 @@ async function installPageHealth(page: Page) {
       new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) health.longTasks.push({ at: Math.round(entry.startTime - health.startedAt), duration: Math.round(entry.duration) })
       }).observe({ entryTypes: ["longtask"] })
-    } catch (error) {
-      health.stalls.push({ at: at(), gap: -1 })
-      void error
+    } catch {
+      // A browser without long-task support still records the timer stalls above.
     }
     document.addEventListener("visibilitychange", () => health.visibility.push({ at: at(), state: document.visibilityState }))
   })
