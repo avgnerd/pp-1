@@ -265,7 +265,7 @@ test("initial converted playback advances before a real reload opens a new sessi
   await ready(page)
   await convert(page)
   const advanceWatch = await installPlaybackWatch(page, { kind: "advance", position: 200, target: 201, deadlineMs: 15_000, pauseAfter: true })
-  let ahead: PlaybackObservation | null = null
+  let ahead: PlaybackObservation | null
   try {
     ahead = await playbackWatchResult(page, advanceWatch)
   } finally {
