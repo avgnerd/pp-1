@@ -13,6 +13,92 @@ type LastValidState = { time: number; rate: number; paused: boolean; src: string
 // rejecting an unrelated source (for example next.mp4 at 0).
 const RECOVERY_POSITION_TOLERANCE = 1
 
+// A page-side wait such as "the transition finished" is driven by requestAnimationFrame, so a page
+// that stops producing frames never resolves it and the test dies at whichever line happens to be
+// running. These deadlines are far above a real transition (the longest is 350 ms) and far below the
+// test timeout, so an unresponsive page fails at the step that waits on it.
+const CONTROL_SETTLE_DEADLINE_MS = 15_000
+const MENU_SETTLE_DEADLINE_MS = 15_000
+
+async function withDeadline<T>(work: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${message} within ${milliseconds} ms`)), milliseconds)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// Frame production and main-thread stalls are not visible in a Playwright timeout, which reports the
+// line that happened to be running. Record them in the page and attach the record when a test fails.
+// The sampler uses a timer rather than an animation frame so it does not itself keep the page painting.
+async function installPageHealth(page: Page) {
+  await page.addInitScript(() => {
+    const scope = window as Window & {
+      __pageHealth?: { startedAt: number; stalls: { at: number; gap: number }[]; longTasks: { at: number; duration: number }[]; visibility: { at: number; state: string }[] }
+    }
+    if (scope.__pageHealth) return
+    const health = { startedAt: performance.now(), stalls: [] as { at: number; gap: number }[], longTasks: [] as { at: number; duration: number }[], visibility: [] as { at: number; state: string }[] }
+    scope.__pageHealth = health
+    const at = () => Math.round(performance.now() - health.startedAt)
+    let last = performance.now()
+    setInterval(() => {
+      const now = performance.now()
+      const gap = now - last
+      last = now
+      if (gap > 500) health.stalls.push({ at: at(), gap: Math.round(gap) })
+    }, 250)
+    try {
+      new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) health.longTasks.push({ at: Math.round(entry.startTime - health.startedAt), duration: Math.round(entry.duration) })
+      }).observe({ entryTypes: ["longtask"] })
+    } catch (error) {
+      health.stalls.push({ at: at(), gap: -1 })
+      void error
+    }
+    document.addEventListener("visibilitychange", () => health.visibility.push({ at: at(), state: document.visibilityState }))
+  })
+}
+
+// Asks the page whether it is currently painting, bounded so a stalled page cannot hang the check.
+async function probeFrameClock(page: Page) {
+  return withDeadline(
+    page.evaluate(() => new Promise<{ frames: number; elapsed: number; visibility: string }>((resolve) => {
+      const started = performance.now()
+      let frames = 0
+      const tick = () => {
+        frames++
+        if (frames < 3) requestAnimationFrame(tick)
+        else resolve({ frames, elapsed: Math.round(performance.now() - started), visibility: document.visibilityState })
+      }
+      requestAnimationFrame(tick)
+    })),
+    2_000,
+    "page did not produce a frame",
+  ).catch((error: Error) => ({ error: error.message }))
+}
+
+test.beforeEach(async ({ page }) => {
+  await installPageHealth(page)
+})
+
+test.afterEach(async ({ page }, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) return
+  const health = await page
+    .evaluate(() => (window as Window & { __pageHealth?: unknown }).__pageHealth ?? null)
+    .catch(() => null)
+  const frameClock = await probeFrameClock(page)
+  await testInfo.attach("page-health", {
+    body: JSON.stringify({ health, frameClock, testStatus: testInfo.status }, null, 2),
+    contentType: "application/json",
+  })
+})
+
 const openRootMenu = (page: Page) => page.locator('[role="menu"][data-open]:not([data-submenu])')
 const openSubmenuPanel = (page: Page) => page.locator('[role="menu"][data-submenu][data-open]')
 
@@ -27,7 +113,7 @@ async function settleMenu(menu: Locator, requireFocus = false) {
   // Base UI focuses the selected item when a submenu opens, but a root menu can keep focus on the
   // trigger, so only the submenu requires focus to be inside.
   if (requireFocus) await expect.poll(() => menu.evaluate(node => node.contains(document.activeElement))).toBe(true)
-  await menu.evaluate(node => new Promise<void>(resolve => {
+  await withDeadline(menu.evaluate(node => new Promise<void>(resolve => {
     let lastY = window.scrollY
     let last = node.getBoundingClientRect()
     let stable = 0
@@ -39,7 +125,7 @@ async function settleMenu(menu: Locator, requireFocus = false) {
       else requestAnimationFrame(tick)
     }
     requestAnimationFrame(tick)
-  }))
+  })), MENU_SETTLE_DEADLINE_MS, "menu box did not settle")
 }
 
 async function openSubmenu(page: Page, title: RegExp | string): Promise<Locator> {
@@ -1004,7 +1090,7 @@ async function readFocusRing(target: Locator) {
 // element's own CSS transitions to finish (or stay absent for several frames when the focused
 // surface never starts one). This is event driven, not a fixed sleep.
 async function settleControlTransition(target: Locator) {
-  await target.evaluate(async element => {
+  await withDeadline(target.evaluate(async element => {
     for (let round = 0; round < 30; round++) {
       const running = element.getAnimations()
       if (running.length > 0) {
@@ -1020,7 +1106,7 @@ async function settleControlTransition(target: Locator) {
       if (quiet === 3) return
     }
     throw new Error("media control transition did not settle")
-  })
+  }), CONTROL_SETTLE_DEADLINE_MS, "media control transition did not settle")
 }
 
 async function tabUntilFocused(page: Page, target: Locator, limit = 50) {
