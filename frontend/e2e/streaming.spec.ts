@@ -339,6 +339,42 @@ async function convert(page: Page) {
   await page.keyboard.press("Escape")
 }
 
+// The player heartbeats its HLS session every 20 s (media-player.tsx), which is what keeps the
+// server from reaping a paused session. Record when each beat leaves the page, keyed by the session
+// it names: a beat the browser's network stack drops produces a request with no response, so a
+// response-only wait cannot tell it apart from a beat that was never sent.
+function watchHeartbeats(page: Page) {
+  const beats: { at: number; id: string }[] = []
+  const answers: { id: string; status: number }[] = []
+  let session = { id: "", openedAt: 0 }
+  page.on("request", request => {
+    const { pathname } = new URL(request.url())
+    if (request.method() === "POST" && pathname.endsWith("/ping")) beats.push({ at: Date.now(), id: pathname.split("/")[4] })
+  })
+  page.on("response", response => {
+    const { pathname } = new URL(response.url())
+    if (pathname.endsWith("/ping")) answers.push({ id: pathname.split("/")[4], status: response.status() })
+  })
+  page.on("response", async response => {
+    const { pathname } = new URL(response.url())
+    if (response.request().method() !== "POST" || pathname !== "/api/media/hls") return
+    const body = (await response.json().catch(() => null)) as { id?: string } | null
+    if (body?.id) session = { id: body.id, openedAt: Date.now() }
+  })
+  return { beats, answers, session: () => session }
+}
+
+// A beat has to leave the page on the interval's own cadence. The measured beat in run 43101354659
+// arrived 20.015 s after its session opened; 18-26 s accepts scheduler slack on a loaded runner and
+// still rejects a beat an interval restart pushed past the render that restarted it.
+function expectBeatCadence(heartbeats: ReturnType<typeof watchHeartbeats>) {
+  const { id, openedAt } = heartbeats.session()
+  const beat = heartbeats.beats.find(entry => entry.id === id)
+  if (!beat) throw new Error(`no heartbeat request for session ${id || "(no session opened)"}`)
+  expect(beat.at - openedAt).toBeGreaterThanOrEqual(18_000)
+  expect(beat.at - openedAt).toBeLessThanOrEqual(26_000)
+}
+
 test("initial converted playback advances before a real reload opens a new session", async ({ page }) => {
   test.setTimeout(90_000)
   const sessionIds: string[] = []
@@ -1259,4 +1295,42 @@ test("a current HLS recovery reloads an unchanged playlist while retaining pause
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeCloseTo(200)
+})
+
+// The heartbeat keeps a paused player's session alive, so an interval that a render restarts before
+// it reaches 20 s never keeps anything alive. The player re-renders on preference and media events;
+// this forces a re-render every 250 ms through the beat window, where a dependency that changes
+// identity on a render restarts the interval faster than its own timer can fire.
+test("the HLS heartbeat keeps its 20 s cadence while the player re-renders", async ({ page }) => {
+  test.setTimeout(60_000)
+  const heartbeats = watchHeartbeats(page)
+  await ready(page)
+  await convert(page)
+  await expect.poll(() => heartbeats.session().id).not.toBe("")
+  await page.evaluate(() => {
+    const video = document.querySelector("video")
+    if (!video) throw new Error("the converted video was not found")
+    const scope = window as Window & { __dvfsBeatPoke?: () => void }
+    let n = 0
+    // A volume write is app state the player subscribes to, and this media has no audio track.
+    const timer = setInterval(() => { video.volume = n++ % 2 ? 0.5 : 0.6 }, 250)
+    scope.__dvfsBeatPoke = () => clearInterval(timer)
+  })
+  try {
+    await expect.poll(() => heartbeats.beats.filter(beat => beat.id === heartbeats.session().id).length, {
+      timeout: 30_000,
+      message: "the heartbeat did not leave the page while the player re-rendered",
+    }).toBeGreaterThan(0)
+  } finally {
+    await page.evaluate(() => (window as Window & { __dvfsBeatPoke?: () => void }).__dvfsBeatPoke?.()).catch(() => {})
+  }
+  expectBeatCadence(heartbeats)
+  // The pokes have to reach the store, otherwise the cadence above proves nothing about re-renders:
+  // the poked values are 0.5 and 0.6, and only a write from the media element stores either one.
+  const storedVolume = await page.evaluate(() => (JSON.parse(localStorage.getItem("dvfs-prefs") ?? "{}") as { state?: { volume?: number } }).state?.volume)
+  expect([0.5, 0.6]).toContain(storedVolume)
+  const { id } = heartbeats.session()
+  // A dropped beat has no answer at all; this rejects a wrong one without turning a loss into a fail.
+  expect(heartbeats.answers.filter(answer => answer.id === id).every(answer => answer.status === 200)).toBe(true)
+  await test.info().attach("heartbeat-cadence", { body: JSON.stringify({ session: heartbeats.session(), beats: heartbeats.beats, answers: heartbeats.answers }, null, 2), contentType: "application/json" })
 })
