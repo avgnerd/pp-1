@@ -624,6 +624,58 @@ test("an unrelated audio error retains the default dismiss action", async ({ pag
   await expect(dialog).not.toBeVisible()
 })
 
+test("an audio error reopens the dialog while its close transition is still running", async ({ page }) => {
+  test.setTimeout(90_000)
+  await page.route("**/api/config", async route => {
+    const response = await route.fetch()
+    await route.fulfill({ json: { ...await response.json(), transcode: false } })
+  })
+  await page.route("**/api/fs/stat?*", route => route.fulfill({ json: { name: "demo.mp3", path: "/demo.mp3", type: "file", rev: "audio-fixture", size: 1000 } }))
+  await page.goto("/demo.mp3")
+  const audio = page.locator("audio")
+  await expect.poll(() => audio.evaluate((a: HTMLAudioElement) => a.readyState)).toBeGreaterThanOrEqual(1)
+  const dialog = page.getByRole("alertdialog")
+  await audio.evaluate((a: HTMLAudioElement) => { a.src = "data:audio/mp3;base64,AAAA"; a.load() })
+  await expect(dialog).toBeVisible()
+  // Dismissing clears the error and starts the dialog's close transition. A second load failure that
+  // lands before that transition finishes must reopen the dialog; a plain "is it visible" check
+  // passes during the exit itself, so this waits for the popup to land on the open state. The exit is
+  // lengthened to five seconds for this test only, which makes the race deterministic instead of a
+  // function of machine speed.
+  await page.addStyleTag({ content: "[role='alertdialog'][data-ending-style] { transition-duration: 5000ms !important; }" })
+  await page.evaluate(() => {
+    const scope = window as Window & { __dvfsDialogStates?: string[] }
+    const states: string[] = []
+    scope.__dvfsDialogStates = states
+    let last = ""
+    const record = () => {
+      const popup = document.querySelector("[role='alertdialog']")
+      const state = !popup ? "closed" : popup.hasAttribute("data-ending-style") ? "ending" : popup.hasAttribute("data-starting-style") ? "starting" : "open"
+      if (state === last) return
+      last = state
+      states.push(state)
+    }
+    record()
+    new MutationObserver(record).observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["data-open", "data-ending-style", "data-starting-style"],
+    })
+  })
+  await dialog.getByRole("button").click()
+  await expect.poll(() => page.evaluate(() => document.querySelector("[role='alertdialog']")?.hasAttribute("data-ending-style") ?? false)).toBe(true)
+  await audio.evaluate((a: HTMLAudioElement) => { a.src = "data:audio/mp3;base64,AAAB"; a.load() })
+  await expect.poll(() => page.evaluate(() => {
+    const popup = document.querySelector("[role='alertdialog']")
+    return !!popup && popup.hasAttribute("data-open") && !popup.hasAttribute("data-ending-style") && !popup.hasAttribute("data-starting-style")
+  }), { timeout: 20_000 }).toBe(true)
+  const states = await page.evaluate(() => (window as Window & { __dvfsDialogStates?: string[] }).__dvfsDialogStates ?? [])
+  expect(states).toContain("ending")
+  expect(states[states.length - 1]).toBe("open")
+  await expect(dialog).toBeVisible()
+})
+
 test("VR renders current decoded frames after conversion, HLS recovery and a fresh link", async ({ page }) => {
   await page.addInitScript(() => {
     const frames = new WeakMap<HTMLVideoElement, number>()

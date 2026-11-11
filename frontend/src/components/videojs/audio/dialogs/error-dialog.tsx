@@ -1,6 +1,7 @@
 import { ErrorDialog } from '@videojs/react';
 
 import { Button } from '@/components/videojs/ui/button';
+import { ReopenOnNewError } from '@/components/videojs/ui/reopen-on-new-error';
 import { usePlayerSlots } from '@/components/videojs/slots';
 import { cn } from '@/lib/resolve-class-name';
 
@@ -8,6 +9,7 @@ export function AudioErrorDialog() {
   const { retryPlayback } = usePlayerSlots();
   return (
     <ErrorDialog.Root>
+      <ReopenOnNewError />
       <ErrorDialog.Backdrop className={'hidden'} />
       <ErrorDialog.Popup
         className={cn(
