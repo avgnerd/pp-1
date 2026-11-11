@@ -1,0 +1,20 @@
+# main is the default branch, and GitHub Actions only keeps a workflow registered while its file
+# exists here, so this file exists to register "CI". The real pipeline is the ci.yml on each code
+# branch, and dispatching that branch runs its file, not this one.
+name: CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder:
+    name: Default branch placeholder
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Explain why main has nothing to verify
+        run: echo "main has no code; run this workflow on a branch that contains the code"
