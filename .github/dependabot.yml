@@ -1,12 +1,8 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-
 version: 2
 updates:
-  - package-ecosystem: "gomod" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  # go.mod lives in /backend, not at the repository root.
+  - package-ecosystem: "gomod"
+    directory: "/backend"
     schedule:
       interval: "weekly"
     groups:
@@ -14,3 +10,7 @@ updates:
         patterns:
           - "github.com/gin-gonic/*"
           - "github.com/gin-contrib/*"
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
