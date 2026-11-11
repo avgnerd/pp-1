@@ -527,6 +527,7 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     let failures = 0
     let opens = 0
     const pings: number[] = []
+    const heartbeats = watchHeartbeats(page)
     page.on("request", request => {
       if (request.method() === "POST" && new URL(request.url()).pathname === "/api/media/hls") opens++
     })
@@ -560,11 +561,19 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     await expect(retry).toBeVisible()
     if (fullscreen) await expect.poll(() => retry.evaluate(button => document.fullscreenElement?.contains(button))).toBe(true)
     expect(opens).toBe(2)
-    const heartbeat = await page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ping"), { timeout: 25_000 })
+    // Two beats, not one. The player sends a beat every 20 s and the server reaps a session only
+    // after 3x its 60 s idle timeout without one, but a beat can fail in the browser's network
+    // stack: in run 43101354659 the beat was sent on schedule and dropped with
+    // net::ERR_NO_BUFFER_SPACE, so a single-beat 25 s window saw no response at all.
+    const heartbeat = await page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ping"), { timeout: 45_000 })
     expect(heartbeat.status()).toBe(200)
+    // The beat has to name the session the player holds now: a ping for a session it already
+    // replaced answers 200 as well, which would hide a heartbeat that stopped following the new one.
+    expect(new URL(heartbeat.url()).pathname).toBe(`/api/media/hls/${heartbeats.session().id}/ping`)
     expect(pings.length).toBeGreaterThanOrEqual(3)
     expect(pings.every(status => status === 200)).toBe(true)
     expect(opens).toBe(2)
+    expectBeatCadence(heartbeats)
     await expect(page).toHaveURL(/\/demo\.mp4$/)
 
     await retry.click()
