@@ -506,6 +506,62 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
   })
 }
 
+// The retry clears the error and starts the dialog's close transition. A terminal failure that
+// lands before that transition finishes must reopen the dialog; a plain "is it visible" check
+// passes during the exit itself, so this waits for the popup to land on the open state. The exit is
+// lengthened to five seconds for this test only, which makes the race deterministic instead of a
+// function of machine speed.
+test("a terminal failure reopens the dialog while its close transition is still running", async ({ page }) => {
+  test.setTimeout(90_000)
+  await ready(page)
+  await convert(page)
+  let failures = 0
+  await page.route("**/seg*.ts", async route => {
+    const segment = /seg(\d+)\.ts$/.exec(new URL(route.request().url()).pathname)
+    if (segment && Number(segment[1]) >= 50) {
+      failures++
+      await route.fulfill({ status: 410, json: { code: "past_end" } })
+    } else await route.continue()
+  })
+  await page.locator("video").evaluate((v: HTMLVideoElement) => { v.pause(); v.currentTime = 200 })
+  await expect.poll(() => failures).toBeGreaterThanOrEqual(3)
+  const dialog = page.getByRole("alertdialog")
+  const retry = page.getByRole("button", { name: "다시 재생", exact: true })
+  await expect(retry).toBeVisible()
+
+  await page.addStyleTag({ content: "[role='alertdialog'][data-ending-style] { transition-duration: 5000ms !important; }" })
+  await page.evaluate(() => {
+    const scope = window as Window & { __dvfsDialogStates?: string[] }
+    const states: string[] = []
+    scope.__dvfsDialogStates = states
+    let last = ""
+    const record = () => {
+      const popup = document.querySelector("[role='alertdialog']")
+      const state = !popup ? "closed" : popup.hasAttribute("data-ending-style") ? "ending" : popup.hasAttribute("data-starting-style") ? "starting" : "open"
+      if (state === last) return
+      last = state
+      states.push(state)
+    }
+    record()
+    new MutationObserver(record).observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["data-open", "data-ending-style", "data-starting-style"],
+    })
+  })
+  await retry.click()
+  await expect.poll(() => page.evaluate(() => {
+    const popup = document.querySelector("[role='alertdialog']")
+    return !!popup && popup.hasAttribute("data-open") && !popup.hasAttribute("data-ending-style") && !popup.hasAttribute("data-starting-style")
+  }), { timeout: 20_000 }).toBe(true)
+  const states = await page.evaluate(() => (window as Window & { __dvfsDialogStates?: string[] }).__dvfsDialogStates ?? [])
+  expect(states).toContain("ending")
+  expect(states[states.length - 1]).toBe("open")
+  await expect(dialog).toContainText("다시 재생")
+  await expect(retry).toBeVisible()
+})
+
 test("returning to a cached HLS source clears the previous terminal failure", async ({ page }) => {
   await ready(page)
   let playlist = ""
