@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -209,7 +210,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, u.String(), http.StatusFound)
 		return
 	}
-	fmt.Fprintf(w, "<html><body>Access code: <code id=code>%s</code></body></html>", code)
+	fmt.Fprintf(w, "<html><body>Access code: <code id=code>%s</code></body></html>", html.EscapeString(code))
 }
 
 func (s *Server) token(w http.ResponseWriter, r *http.Request) {
