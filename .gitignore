@@ -25,4 +25,9 @@
 /.claude/
 /.mcp.json
 /agent/
-/.kiro/skills/
+/.kiro/
+# root notes and scratch files, kept locally only
+/AGENTS.md
+/README.md
+/dropbox.txt
+/audio-init.mp4
