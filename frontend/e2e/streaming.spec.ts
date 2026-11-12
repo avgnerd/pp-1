@@ -1069,6 +1069,38 @@ test("conversion retains the selected playback rate, pause and position", async 
   await expect(page.getByRole("menuitem", { name: /Speed.*1\.75/ })).toBeVisible()
 })
 
+// The player stores a new rate from the media's ratechange event, which is a queued task. Two frames
+// after the key give that task a chance to run before the next key is resolved against the store, so
+// this reads the settled rate instead of racing the previous key.
+async function pressSpeedKey(page: Page, key: ">" | "<", expected: number) {
+  await page.keyboard.press(key)
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(expected)
+}
+
+test("speed hotkeys step to the nearest rate and stop at both ends", async ({ page }) => {
+  await ready(page)
+  const video = page.locator("video")
+  await video.evaluate(async (v: HTMLVideoElement) => { v.muted = true; await v.play().catch(() => {}) })
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.paused)).toBe(false)
+  const player = page.getByRole("group", { name: "Media player" })
+  // Hotkeys listen on the container, so focus reaches the container the way a user's click does. The
+  // point sits in the left third, away from the center tap that toggles pause.
+  await player.click({ position: { x: 8, y: 8 } })
+  await expect(player).toBeFocused()
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1)
+
+  // 10.3.0 steps to the nearest rate and stops at both ends; 10.2.0 wrapped 2× to 0.2× and the slowest
+  // rate back to 2×, so a wrap at either end fails the repeated end press.
+  for (const rate of [1.25, 1.5, 1.75, 2]) await pressSpeedKey(page, ">", rate)
+  await pressSpeedKey(page, ">", 2)
+  for (const rate of [1.75, 1.5, 1.25, 1, 0.75, 0.5]) await pressSpeedKey(page, "<", rate)
+  await pressSpeedKey(page, "<", 0.5)
+
+  await openSubmenu(page, /Speed/)
+  await expect(page.getByRole("menuitemradio", { name: "0.5×", exact: true })).toHaveAttribute("aria-checked", "true")
+})
+
 for (const autoNext of [false, true]) {
   test(`a valid near-end segment failure recovers with auto-next ${autoNext ? "on" : "off"}`, async ({ page, request }) => {
     await page.addInitScript(on => localStorage.setItem("dvfs-prefs", JSON.stringify({ state: { autoNext: on }, version: 0 })), autoNext)
