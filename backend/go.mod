@@ -5,7 +5,7 @@ go 1.27.3
 require (
 	github.com/bodgit/sevenzip v1.6.5
 	github.com/gin-gonic/gin v1.12.0
-	github.com/nwaples/rardecode/v2 v2.4.5
+	github.com/nwaples/rardecode/v2 v2.4.6
 	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sync v0.25.0
