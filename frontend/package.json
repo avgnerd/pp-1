@@ -24,7 +24,7 @@
     "@tanstack/react-virtual": "^3.14.26",
     "@videojs/core": "^10.2.0",
     "@videojs/hlsjs-video": "^10.2.0",
-    "@videojs/react": "^10.2.0",
+    "@videojs/react": "^10.3.0",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.5.1",
     "highlight.js": "^11.12.0",
