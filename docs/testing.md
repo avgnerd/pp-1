@@ -53,11 +53,11 @@ npm run e2e
 
 테스트 개수는 테스트를 추가할 때마다 바뀌므로 이 문서에 고정하지 않습니다. `npm run e2e`가 마지막에 출력하는 요약 줄(`all 3 configs passed: ...`)이나 설정별 `npx playwright test --config=<설정> --list`로 확인합니다.
 
-| 설정 | 파일 | 테스트 | 서버 |
+| 설정 | 파일 | spec 파일 | 서버 |
 | --- | --- | --- | --- |
-| smoke | `playwright.config.ts` | `smoke.spec.ts` 4개 | 실제 Go 서버(`:8099`)와 fake Dropbox(`127.0.0.1:9911`) |
-| streaming | `playwright.streaming.config.ts` | `streaming.spec.ts` 20개 | `e2e/fixtures/streaming-server.cjs`(`127.0.0.1:18764`) |
-| browse | `playwright.browse.config.ts` | `browse.spec.ts` 14개, `search.spec.ts` 24개 | `e2e/fixtures`의 Vite fixture 서버 |
+| smoke | `playwright.config.ts` | `smoke.spec.ts` | 실제 Go 서버(`:8099`)와 fake Dropbox(`127.0.0.1:9911`) |
+| streaming | `playwright.streaming.config.ts` | `streaming.spec.ts` | `e2e/fixtures/streaming-server.cjs`(`127.0.0.1:18764`) |
+| browse | `playwright.browse.config.ts` | `browse.spec.ts`, `search.spec.ts` | `e2e/fixtures`의 Vite fixture 서버 |
 
 browse 설정은 Go 서버와 fake Dropbox를 띄우지 않습니다. 두 fixture 서버가 API 응답을 대신합니다.
 
