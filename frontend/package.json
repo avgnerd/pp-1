@@ -23,7 +23,7 @@
     "@tanstack/react-router": "^1.170.46",
     "@tanstack/react-virtual": "^3.14.26",
     "@videojs/core": "^10.2.0",
-    "@videojs/hlsjs-video": "^10.2.0",
+    "@videojs/hlsjs-video": "^10.3.0",
     "@videojs/react": "^10.2.0",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.5.1",
