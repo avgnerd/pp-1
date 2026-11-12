@@ -26,7 +26,7 @@
     "@videojs/hlsjs-video": "^10.3.0",
     "@videojs/react": "^10.3.0",
     "class-variance-authority": "^0.7.1",
-    "cn": "^0.5.1",
+    "cn": "^0.5.2",
     "highlight.js": "^11.12.0",
     "lightgallery": "^3.0.0",
     "lucide-react": "^1.66.0",
