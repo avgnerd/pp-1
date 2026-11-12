@@ -51,13 +51,13 @@ npm run e2e
 
 `npm run e2e`는 `frontend/scripts/run-e2e.mjs`를 실행합니다. 세 설정을 smoke, streaming, browse 순서로 실행하고 첫 실패에서 멈춥니다. 종료 코드는 0이면 모두 통과, 아니면 첫 실패한 Playwright 실행의 종료 코드입니다. 실패 뒤의 설정은 실행하지 않습니다.
 
-현재 스위트는 62개 테스트입니다.
+테스트 개수는 테스트를 추가할 때마다 바뀌므로 이 문서에 고정하지 않습니다. `npm run e2e`가 마지막에 출력하는 요약 줄(`all 3 configs passed: ...`)이나 설정별 `npx playwright test --config=<설정> --list`로 확인합니다.
 
-| 설정 | 파일 | 테스트 | 서버 |
+| 설정 | 파일 | spec 파일 | 서버 |
 | --- | --- | --- | --- |
-| smoke | `playwright.config.ts` | `smoke.spec.ts` 4개 | 실제 Go 서버(`:8099`)와 fake Dropbox(`127.0.0.1:9911`) |
-| streaming | `playwright.streaming.config.ts` | `streaming.spec.ts` 20개 | `e2e/fixtures/streaming-server.cjs`(`127.0.0.1:18764`) |
-| browse | `playwright.browse.config.ts` | `browse.spec.ts` 14개, `search.spec.ts` 24개 | `e2e/fixtures`의 Vite fixture 서버 |
+| smoke | `playwright.config.ts` | `smoke.spec.ts` | 실제 Go 서버(`:8099`)와 fake Dropbox(`127.0.0.1:9911`) |
+| streaming | `playwright.streaming.config.ts` | `streaming.spec.ts` | `e2e/fixtures/streaming-server.cjs`(`127.0.0.1:18764`) |
+| browse | `playwright.browse.config.ts` | `browse.spec.ts`, `search.spec.ts` | `e2e/fixtures`의 Vite fixture 서버 |
 
 browse 설정은 Go 서버와 fake Dropbox를 띄우지 않습니다. 두 fixture 서버가 API 응답을 대신합니다.
 
@@ -141,7 +141,7 @@ workflow는 `actions/checkout@v7.0.1`, `actions/setup-go@v7.0.0`, `actions/setup
 4. `scripts/ci/embed-frontend.ps1`
 5. `scripts/ci/run-e2e.ps1`이 `npm run e2e`를 실행
 
-E2E는 62개 테스트를 세 설정에서 `msedge`로 실행합니다. fake Dropbox와 실행마다 새로 만드는 임시 데이터 디렉터리를 쓰고, `data-playwright`와 실제 Dropbox 계정은 쓰지 않습니다. workflow는 `continue-on-error`와 재시도를 쓰지 않습니다. Go 미디어 테스트는 FFmpeg가 없으면 스스로 skip하므로 CI는 FFmpeg 준비를 먼저 검사합니다.
+E2E는 테스트를 세 설정에서 `msedge`로 실행합니다. fake Dropbox와 실행마다 새로 만드는 임시 데이터 디렉터리를 쓰고, `data-playwright`와 실제 Dropbox 계정은 쓰지 않습니다. workflow는 `continue-on-error`와 재시도를 쓰지 않습니다. Go 미디어 테스트는 FFmpeg가 없으면 스스로 skip하므로 CI는 FFmpeg 준비를 먼저 검사합니다.
 
 helper는 호출자 경로 인자를 받지 않습니다. `embed-frontend.ps1`은 스크립트가 속한 저장소의 `frontend/dist`와 `backend/internal/web/dist`만 씁니다. `prepare-ffmpeg.ps1`은 OS 임시 디렉터리의 `dvfs-ffmpeg`만 씁니다. 두 스크립트는 reparse point를 따라가지 않습니다. `prepare-ffmpeg.ps1`은 자기가 만든 표시 파일(`.dvfs-ci-ffmpeg`)이 없는 디렉터리를 수정하지 않고 실패합니다.
 

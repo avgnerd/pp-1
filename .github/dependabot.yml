@@ -10,6 +10,10 @@ updates:
         patterns:
           - "github.com/gin-gonic/*"
           - "github.com/gin-contrib/*"
+      # The golang.org/x modules bump together with the toolchain; one PR per week, not six.
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
   - package-ecosystem: "npm"
     directory: "/frontend"
     schedule:
@@ -19,6 +23,12 @@ updates:
       videojs:
         patterns:
           - "@videojs/*"
+      # Production minor/patch in one PR; majors stay solo. Below videojs because first match wins.
+      production-dependencies:
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
       dev-dependencies:
         dependency-type: "development"
         update-types:
