@@ -13,6 +13,91 @@ type LastValidState = { time: number; rate: number; paused: boolean; src: string
 // rejecting an unrelated source (for example next.mp4 at 0).
 const RECOVERY_POSITION_TOLERANCE = 1
 
+// A page-side wait such as "the transition finished" is driven by requestAnimationFrame, so a page
+// that stops producing frames never resolves it and the test dies at whichever line happens to be
+// running. These deadlines are far above a real transition (the longest is 350 ms) and far below the
+// test timeout, so an unresponsive page fails at the step that waits on it.
+const CONTROL_SETTLE_DEADLINE_MS = 15_000
+const MENU_SETTLE_DEADLINE_MS = 15_000
+
+async function withDeadline<T>(work: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${message} within ${milliseconds} ms`)), milliseconds)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// Frame production and main-thread stalls are not visible in a Playwright timeout, which reports the
+// line that happened to be running. Record them in the page and attach the record when a test fails.
+// The sampler uses a timer rather than an animation frame so it does not itself keep the page painting.
+async function installPageHealth(page: Page) {
+  await page.addInitScript(() => {
+    const scope = window as Window & {
+      __pageHealth?: { startedAt: number; stalls: { at: number; gap: number }[]; longTasks: { at: number; duration: number }[]; visibility: { at: number; state: string }[] }
+    }
+    if (scope.__pageHealth) return
+    const health = { startedAt: performance.now(), stalls: [] as { at: number; gap: number }[], longTasks: [] as { at: number; duration: number }[], visibility: [] as { at: number; state: string }[] }
+    scope.__pageHealth = health
+    const at = () => Math.round(performance.now() - health.startedAt)
+    let last = performance.now()
+    setInterval(() => {
+      const now = performance.now()
+      const gap = now - last
+      last = now
+      if (gap > 500) health.stalls.push({ at: at(), gap: Math.round(gap) })
+    }, 250)
+    try {
+      new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) health.longTasks.push({ at: Math.round(entry.startTime - health.startedAt), duration: Math.round(entry.duration) })
+      }).observe({ entryTypes: ["longtask"] })
+    } catch {
+      // A browser without long-task support still records the timer stalls above.
+    }
+    document.addEventListener("visibilitychange", () => health.visibility.push({ at: at(), state: document.visibilityState }))
+  })
+}
+
+// Asks the page whether it is currently painting, bounded so a stalled page cannot hang the check.
+async function probeFrameClock(page: Page) {
+  return withDeadline(
+    page.evaluate(() => new Promise<{ frames: number; elapsed: number; visibility: string }>((resolve) => {
+      const started = performance.now()
+      let frames = 0
+      const tick = () => {
+        frames++
+        if (frames < 3) requestAnimationFrame(tick)
+        else resolve({ frames, elapsed: Math.round(performance.now() - started), visibility: document.visibilityState })
+      }
+      requestAnimationFrame(tick)
+    })),
+    2_000,
+    "page did not produce a frame",
+  ).catch((error: Error) => ({ error: error.message }))
+}
+
+test.beforeEach(async ({ page }) => {
+  await installPageHealth(page)
+})
+
+test.afterEach(async ({ page }, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) return
+  const health = await page
+    .evaluate(() => (window as Window & { __pageHealth?: unknown }).__pageHealth ?? null)
+    .catch(() => null)
+  const frameClock = await probeFrameClock(page)
+  await testInfo.attach("page-health", {
+    body: JSON.stringify({ health, frameClock, testStatus: testInfo.status }, null, 2),
+    contentType: "application/json",
+  })
+})
+
 const openRootMenu = (page: Page) => page.locator('[role="menu"][data-open]:not([data-submenu])')
 const openSubmenuPanel = (page: Page) => page.locator('[role="menu"][data-submenu][data-open]')
 
@@ -27,7 +112,7 @@ async function settleMenu(menu: Locator, requireFocus = false) {
   // Base UI focuses the selected item when a submenu opens, but a root menu can keep focus on the
   // trigger, so only the submenu requires focus to be inside.
   if (requireFocus) await expect.poll(() => menu.evaluate(node => node.contains(document.activeElement))).toBe(true)
-  await menu.evaluate(node => new Promise<void>(resolve => {
+  await withDeadline(menu.evaluate(node => new Promise<void>(resolve => {
     let lastY = window.scrollY
     let last = node.getBoundingClientRect()
     let stable = 0
@@ -39,7 +124,7 @@ async function settleMenu(menu: Locator, requireFocus = false) {
       else requestAnimationFrame(tick)
     }
     requestAnimationFrame(tick)
-  }))
+  })), MENU_SETTLE_DEADLINE_MS, "menu box did not settle")
 }
 
 async function openSubmenu(page: Page, title: RegExp | string): Promise<Locator> {
@@ -254,6 +339,42 @@ async function convert(page: Page) {
   await page.keyboard.press("Escape")
 }
 
+// The player heartbeats its HLS session every 20 s (media-player.tsx), which is what keeps the
+// server from reaping a paused session. Record when each beat leaves the page, keyed by the session
+// it names: a beat the browser's network stack drops produces a request with no response, so a
+// response-only wait cannot tell it apart from a beat that was never sent.
+function watchHeartbeats(page: Page) {
+  const beats: { at: number; id: string }[] = []
+  const answers: { id: string; status: number }[] = []
+  let session = { id: "", openedAt: 0 }
+  page.on("request", request => {
+    const { pathname } = new URL(request.url())
+    if (request.method() === "POST" && pathname.endsWith("/ping")) beats.push({ at: Date.now(), id: pathname.split("/")[4] })
+  })
+  page.on("response", response => {
+    const { pathname } = new URL(response.url())
+    if (pathname.endsWith("/ping")) answers.push({ id: pathname.split("/")[4], status: response.status() })
+  })
+  page.on("response", async response => {
+    const { pathname } = new URL(response.url())
+    if (response.request().method() !== "POST" || pathname !== "/api/media/hls") return
+    const body = (await response.json().catch(() => null)) as { id?: string } | null
+    if (body?.id) session = { id: body.id, openedAt: Date.now() }
+  })
+  return { beats, answers, session: () => session }
+}
+
+// A beat has to leave the page on the interval's own cadence. The measured beat in run 43101354659
+// arrived 20.015 s after its session opened; 18-26 s accepts scheduler slack on a loaded runner and
+// still rejects a beat an interval restart pushed past the render that restarted it.
+function expectBeatCadence(heartbeats: ReturnType<typeof watchHeartbeats>) {
+  const { id, openedAt } = heartbeats.session()
+  const beat = heartbeats.beats.find(entry => entry.id === id)
+  if (!beat) throw new Error(`no heartbeat request for session ${id || "(no session opened)"}`)
+  expect(beat.at - openedAt).toBeGreaterThanOrEqual(18_000)
+  expect(beat.at - openedAt).toBeLessThanOrEqual(26_000)
+}
+
 test("initial converted playback advances before a real reload opens a new session", async ({ page }) => {
   test.setTimeout(90_000)
   const sessionIds: string[] = []
@@ -406,6 +527,7 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     let failures = 0
     let opens = 0
     const pings: number[] = []
+    const heartbeats = watchHeartbeats(page)
     page.on("request", request => {
       if (request.method() === "POST" && new URL(request.url()).pathname === "/api/media/hls") opens++
     })
@@ -439,11 +561,19 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
     await expect(retry).toBeVisible()
     if (fullscreen) await expect.poll(() => retry.evaluate(button => document.fullscreenElement?.contains(button))).toBe(true)
     expect(opens).toBe(2)
-    const heartbeat = await page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ping"), { timeout: 25_000 })
+    // Two beats, not one. The player sends a beat every 20 s and the server reaps a session only
+    // after 3x its 60 s idle timeout without one, but a beat can fail in the browser's network
+    // stack: in run 43101354659 the beat was sent on schedule and dropped with
+    // net::ERR_NO_BUFFER_SPACE, so a single-beat 25 s window saw no response at all.
+    const heartbeat = await page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ping"), { timeout: 45_000 })
     expect(heartbeat.status()).toBe(200)
+    // The beat has to name the session the player holds now: a ping for a session it already
+    // replaced answers 200 as well, which would hide a heartbeat that stopped following the new one.
+    expect(new URL(heartbeat.url()).pathname).toBe(`/api/media/hls/${heartbeats.session().id}/ping`)
     expect(pings.length).toBeGreaterThanOrEqual(3)
     expect(pings.every(status => status === 200)).toBe(true)
     expect(opens).toBe(2)
+    expectBeatCadence(heartbeats)
     await expect(page).toHaveURL(/\/demo\.mp4$/)
 
     await retry.click()
@@ -1004,7 +1134,7 @@ async function readFocusRing(target: Locator) {
 // element's own CSS transitions to finish (or stay absent for several frames when the focused
 // surface never starts one). This is event driven, not a fixed sleep.
 async function settleControlTransition(target: Locator) {
-  await target.evaluate(async element => {
+  await withDeadline(target.evaluate(async element => {
     for (let round = 0; round < 30; round++) {
       const running = element.getAnimations()
       if (running.length > 0) {
@@ -1020,7 +1150,7 @@ async function settleControlTransition(target: Locator) {
       if (quiet === 3) return
     }
     throw new Error("media control transition did not settle")
-  })
+  }), CONTROL_SETTLE_DEADLINE_MS, "media control transition did not settle")
 }
 
 async function tabUntilFocused(page: Page, target: Locator, limit = 50) {
@@ -1174,4 +1304,42 @@ test("a current HLS recovery reloads an unchanged playlist while retaining pause
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeCloseTo(200)
+})
+
+// The heartbeat keeps a paused player's session alive, so an interval that a render restarts before
+// it reaches 20 s never keeps anything alive. The player re-renders on preference and media events;
+// this forces a re-render every 250 ms through the beat window, where a dependency that changes
+// identity on a render restarts the interval faster than its own timer can fire.
+test("the HLS heartbeat keeps its 20 s cadence while the player re-renders", async ({ page }) => {
+  test.setTimeout(60_000)
+  const heartbeats = watchHeartbeats(page)
+  await ready(page)
+  await convert(page)
+  await expect.poll(() => heartbeats.session().id).not.toBe("")
+  await page.evaluate(() => {
+    const video = document.querySelector("video")
+    if (!video) throw new Error("the converted video was not found")
+    const scope = window as Window & { __dvfsBeatPoke?: () => void }
+    let n = 0
+    // A volume write is app state the player subscribes to, and this media has no audio track.
+    const timer = setInterval(() => { video.volume = n++ % 2 ? 0.5 : 0.6 }, 250)
+    scope.__dvfsBeatPoke = () => clearInterval(timer)
+  })
+  try {
+    await expect.poll(() => heartbeats.beats.filter(beat => beat.id === heartbeats.session().id).length, {
+      timeout: 30_000,
+      message: "the heartbeat did not leave the page while the player re-rendered",
+    }).toBeGreaterThan(0)
+  } finally {
+    await page.evaluate(() => (window as Window & { __dvfsBeatPoke?: () => void }).__dvfsBeatPoke?.()).catch(() => {})
+  }
+  expectBeatCadence(heartbeats)
+  // The pokes have to reach the store, otherwise the cadence above proves nothing about re-renders:
+  // the poked values are 0.5 and 0.6, and only a write from the media element stores either one.
+  const storedVolume = await page.evaluate(() => (JSON.parse(localStorage.getItem("dvfs-prefs") ?? "{}") as { state?: { volume?: number } }).state?.volume)
+  expect([0.5, 0.6]).toContain(storedVolume)
+  const { id } = heartbeats.session()
+  // A dropped beat has no answer at all; this rejects a wrong one without turning a loss into a fail.
+  expect(heartbeats.answers.filter(answer => answer.id === id).every(answer => answer.status === 200)).toBe(true)
+  await test.info().attach("heartbeat-cadence", { body: JSON.stringify({ session: heartbeats.session(), beats: heartbeats.beats, answers: heartbeats.answers }, null, 2), contentType: "application/json" })
 })
