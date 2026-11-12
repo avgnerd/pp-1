@@ -21,3 +21,8 @@
 # agent skills are local tooling, not part of the app
 /.agents/
 /skills-lock.json
+# local agent/IDE configuration, may hold machine-specific settings or secrets
+/.claude/
+/.mcp.json
+/agent/
+/.kiro/skills/
