@@ -114,6 +114,7 @@ npx playwright test --config=playwright.browse.config.ts
 - `pull_request`: PR이 열리거나, 갱신되거나, 다시 열릴 때 실행합니다.
 - `push`: `main`에서만 실행합니다. PR 브랜치는 `pull_request`가 검사하므로 push로 다시 돌리지 않습니다. PR 없는 브랜치는 `workflow_dispatch`로 수동 실행합니다.
 - `workflow_dispatch`: 수동으로 실행합니다.
+- `schedule`: 매일 18:37 UTC(KST 03:37)에 `main`을 실행해 간헐 E2E 실패를 찾습니다. cron은 `.github/workflows/ci.yml`의 `on.schedule`에 있습니다.
 - 권한은 `contents: read`만 씁니다. secret, 배포, 쓰기 권한은 쓰지 않습니다.
 
 ### 실행 환경

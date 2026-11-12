@@ -24,3 +24,12 @@ updates:
         update-types:
           - "minor"
           - "patch"
+  # Without this entry nothing bumps the action majors the workflows pin.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

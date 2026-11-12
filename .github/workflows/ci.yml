@@ -1,12 +1,16 @@
 name: CI
 
 # Pull requests are checked by pull_request, main by push, and a branch with no pull request
-# can be run by hand through workflow_dispatch.
+# can be run by hand through workflow_dispatch. A daily schedule re-runs main so an intermittent
+# E2E failure surfaces without waiting for the next push.
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
+  # 18:37 UTC, off the hour and half hour so the run is not queued behind the peak.
+  schedule:
+    - cron: "37 18 * * *"
 
 permissions:
   contents: read
