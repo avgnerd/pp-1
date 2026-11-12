@@ -8,7 +8,7 @@ require (
 	github.com/nwaples/rardecode/v2 v2.4.5
 	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.58.0
-	golang.org/x/sync v0.24.0
+	golang.org/x/sync v0.25.0
 	golang.org/x/text v0.43.0
 	modernc.org/sqlite v1.61.1
 )
