@@ -1059,13 +1059,14 @@ test("conversion retains the selected playback rate, pause and position", async 
   await page.locator("video").evaluate((v: HTMLVideoElement) => { v.pause(); v.currentTime = 12.5 })
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeCloseTo(12.5)
   await openSubmenu(page, /Speed/)
-  await page.getByRole("menuitemradio", { name: "1.7×", exact: true }).click()
+  // 10.3.0 replaced the default rate list with 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2.
+  await page.getByRole("menuitemradio", { name: "1.75×", exact: true }).click()
   await page.keyboard.press("Escape")
-  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.7)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(1.75)
   await convert(page)
-  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => ({ rate: v.playbackRate, paused: v.paused, time: v.currentTime }))).toEqual({ rate: 1.7, paused: true, time: 12.5 })
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => ({ rate: v.playbackRate, paused: v.paused, time: v.currentTime }))).toEqual({ rate: 1.75, paused: true, time: 12.5 })
   await page.getByRole("button", { name: "Settings", exact: true }).click()
-  await expect(page.getByRole("menuitem", { name: /Speed.*1\.7/ })).toBeVisible()
+  await expect(page.getByRole("menuitem", { name: /Speed.*1\.75/ })).toBeVisible()
 })
 
 for (const autoNext of [false, true]) {
