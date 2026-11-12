@@ -4,7 +4,7 @@
 
 ## 준비
 
-- Go 1.27.3 이상. `backend/go.mod`의 `go 1.27.3`을 따릅니다.
+- Go 1.27.4 이상. `backend/go.mod`의 `go 1.27.4`를 따릅니다.
 - Node.js 20.19.x, 22.13 이상, 또는 24 이상. 설치된 `vite@8.3.5`는 `^20.19.0 || >=22.12.0`을, `eslint@10.14.0`은 `^20.19.0 || ^22.13.0 || >=24`를 요구합니다.
 - Microsoft Edge. 세 Playwright 설정 모두 `channel: "msedge"`를 사용합니다.
 - libx264를 포함한 FFmpeg. streaming 설정이 `ffmpeg`로 H.264 영상과 HLS 세그먼트를 만듭니다. `ffmpeg`가 PATH에 없으면 `FFMPEG_PATH`를 지정합니다. `scripts/run-local.ps1`은 `tools\ffmpeg\bin\ffmpeg.exe`에 내려받습니다.
@@ -122,21 +122,21 @@ npx playwright test --config=playwright.browse.config.ts
 | 항목 | 값 |
 | --- | --- |
 | runner | `windows-2025` |
-| Go | `backend/go.mod`의 `go 1.27.3` |
+| Go | `backend/go.mod`의 `go 1.27.4` |
 | Node.js | `24` |
 | 브라우저 | 이미지에 포함된 Microsoft Edge |
 | FFmpeg | `scripts/ci/prepare-ffmpeg.ps1`이 libx264를 포함한 빌드를 준비 |
 
-`windows-2025` 이미지에는 Edge와 Node.js 24가 있고 FFmpeg는 없습니다. Go 1.27.3과 FFmpeg는 CI가 직접 준비합니다. Windows runner 라벨은 [GitHub Docs의 runner 표](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)와 [Windows2025 이미지 목록](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md)을 따릅니다.
+`windows-2025` 이미지에는 Edge와 Node.js 24가 있고 FFmpeg는 없습니다. Go 1.27.4와 FFmpeg는 CI가 직접 준비합니다. Windows runner 라벨은 [GitHub Docs의 runner 표](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)와 [Windows2025 이미지 목록](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md)을 따릅니다.
 
-workflow는 `actions/checkout@v7`, `actions/setup-go@v7`, `actions/setup-node@v7`, `actions/upload-artifact@v7`를 씁니다.
+workflow는 `actions/checkout@v7.0.1`, `actions/setup-go@v7.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-artifact@v7.0.2`를 40자 commit SHA로 고정하고 `# v7.x.y` 주석으로 버전을 남깁니다. Dependabot은 이 주석을 보고 SHA를 갱신합니다.
 
 `prepare-ffmpeg.ps1`은 [BtbN FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)의 `win64-gpl` 빌드를 내려받습니다. `lgpl` 변형에는 libx264가 없고 `gpl` 변형에는 있습니다. 스크립트는 같은 릴리스의 `checksums.sha256`으로 SHA-256을 확인하고, 설치한 바이너리가 `libx264` 인코더를 보고하는지 검사합니다. 내려받는 태그는 `latest`라서 FFmpeg 버전은 실행마다 달라질 수 있습니다. 체크섬은 손상된 다운로드만 걸러 냅니다.
 
 ### 실행 단계
 
 1. `scripts/ci/prepare-ffmpeg.ps1`
-2. `backend`에서 `go build ./...`, `go test ./... -count=1`
+2. `backend`에서 `go build ./...`, `go test ./... -count=1`, `go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...`
 3. `frontend`에서 `npm ci`, `npm run typecheck`, `npm run build`
 4. `scripts/ci/embed-frontend.ps1`
 5. `scripts/ci/run-e2e.ps1`이 `npm run e2e`를 실행
