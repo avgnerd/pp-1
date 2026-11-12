@@ -14,3 +14,13 @@ updates:
     directory: "/frontend"
     schedule:
       interval: "weekly"
+    groups:
+      # Keep @videojs/core, react, and hlsjs-video on one version; they must move together.
+      videojs:
+        patterns:
+          - "@videojs/*"
+      dev-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
