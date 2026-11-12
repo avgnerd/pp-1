@@ -32,3 +32,6 @@
 /dropbox.txt
 /audio-init.mp4
 /install.ps1
+# local-only build script and its output
+/scripts/build-release.ps1
+/release/
