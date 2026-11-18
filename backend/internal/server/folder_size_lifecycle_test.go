@@ -207,7 +207,9 @@ func (p *folderSizePageBarrier) ServeHTTP(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func newFolderSizeLeakServer(t *testing.T, apiBase string) *Server {
+// newProxyServer builds a server whose Dropbox hosts all point at apiBase, so a test can put a
+// proxy in front of the fake and hold or fail individual calls.
+func newProxyServer(t *testing.T, apiBase string) *Server {
 	t.Helper()
 	cfg, err := config.Load(testutil.TempDir(t))
 	if err != nil {
@@ -249,7 +251,7 @@ func TestFolderSizeSSEWriteFailureReleasesScanAfterBufferFull(t *testing.T) {
 	proxy := &folderSizePageBarrier{target: fts.URL, want: wantPages, reached: make(chan struct{})}
 	pts := httptest.NewServer(proxy)
 	t.Cleanup(pts.Close)
-	s := newFolderSizeLeakServer(t, pts.URL)
+	s := newProxyServer(t, pts.URL)
 
 	start, err := s.St.Create(storage.Input{MountPath: "/m", AppKey: "f4-write", AppSecret: "s", AuthMode: storage.AuthCode})
 	if err != nil {

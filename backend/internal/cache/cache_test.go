@@ -1,6 +1,8 @@
 package cache
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -118,7 +120,7 @@ func TestGetOrLoadSingleflight(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			v, err := c.GetOrLoad("x", func() (any, int64, time.Duration, error) {
+			v, err := c.GetOrLoad(context.Background(), "x", time.Hour, func(context.Context) (any, int64, time.Duration, error) {
 				calls.Add(1)
 				time.Sleep(20 * time.Millisecond)
 				return 42, 8, time.Hour, nil
@@ -131,6 +133,124 @@ func TestGetOrLoadSingleflight(t *testing.T) {
 	wg.Wait()
 	if calls.Load() != 1 {
 		t.Fatalf("loader called %d times", calls.Load())
+	}
+}
+
+// A caller leaving must not end the shared load for the callers waiting on the same key, and the
+// caller that left must not stay blocked until the load ends.
+func TestGetOrLoadDetachesSharedLoadFromCaller(t *testing.T) {
+	c := New(1000, 1<<20, time.Hour)
+	defer c.Stop()
+
+	loadStarted := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	load := func(ctx context.Context) (any, int64, time.Duration, error) {
+		if calls.Add(1) > 1 {
+			return nil, 0, 0, errors.New("the shared load restarted instead of being shared")
+		}
+		close(loadStarted)
+		<-release
+		// The load runs on its own context: the first caller has already cancelled by now.
+		if err := ctx.Err(); err != nil {
+			return nil, 0, 0, fmt.Errorf("shared load ran on the caller's context: %w", err)
+		}
+		return 42, 8, time.Hour, nil
+	}
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	type outcome struct {
+		val any
+		err error
+	}
+	aOut := make(chan error, 1)
+	go func() {
+		_, err := c.GetOrLoad(ctxA, "x", time.Minute, load)
+		aOut <- err
+	}()
+	select {
+	case <-loadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the load never started")
+	}
+
+	bOut := make(chan outcome, 1)
+	go func() {
+		v, err := c.GetOrLoad(context.Background(), "x", time.Minute, load)
+		bOut <- outcome{val: v, err: err}
+	}()
+
+	cancelA()
+	select {
+	case err := <-aOut:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled caller returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancelled caller stayed blocked on the shared load")
+	}
+
+	close(release)
+	select {
+	case got := <-bOut:
+		if got.err != nil {
+			t.Fatalf("caller waiting on the shared load failed: %v", got.err)
+		}
+		if got.val.(int) != 42 {
+			t.Fatalf("shared value = %v, want 42", got.val)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller waiting on the shared load never finished")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("loader called %d times, want one shared load", calls.Load())
+	}
+}
+
+// The shared load carries its own deadline, so it cannot run forever once its callers have gone.
+func TestGetOrLoadBoundsTheDetachedLoad(t *testing.T) {
+	c := New(1000, 1<<20, time.Hour)
+	defer c.Stop()
+
+	loadCtxErr := make(chan error, 1)
+	v, err := c.GetOrLoad(context.Background(), "y", 50*time.Millisecond, func(ctx context.Context) (any, int64, time.Duration, error) {
+		<-ctx.Done()
+		loadCtxErr <- ctx.Err()
+		return nil, 0, 0, ctx.Err()
+	})
+	if v != nil {
+		t.Fatalf("value = %v, want none", v)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("caller got %v, want the load's deadline", err)
+	}
+	if got := <-loadCtxErr; !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("load context ended with %v, want its own deadline", got)
+	}
+}
+
+// A failed load is not cached, so a later caller retries instead of inheriting the failure.
+func TestGetOrLoadDoesNotCacheErrors(t *testing.T) {
+	c := New(1000, 1<<20, time.Hour)
+	defer c.Stop()
+
+	var calls atomic.Int32
+	load := func(context.Context) (any, int64, time.Duration, error) {
+		if calls.Add(1) == 1 {
+			return nil, 0, 0, errors.New("transient")
+		}
+		return 7, 8, time.Hour, nil
+	}
+	if _, err := c.GetOrLoad(context.Background(), "z", time.Minute, load); err == nil {
+		t.Fatal("first load should fail")
+	}
+	v, err := c.GetOrLoad(context.Background(), "z", time.Minute, load)
+	if err != nil || v.(int) != 7 {
+		t.Fatalf("retry = %v, %v; want the retried value 7", v, err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("loader called %d times, want a retry", calls.Load())
 	}
 }
 
