@@ -372,3 +372,67 @@ test("path helpers decode safely and compare case-insensitively", async ({
   })
 })
 
+test("file changes invalidate stat, siblings and picker caches case-insensitively", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic")
+  const states = await page.evaluate(async () => {
+    const { afterChange, queryClient } = await import("/src/lib/queries.ts")
+    const cached = {
+      stat: ["stat", "/synthetic/A/only-A"],
+      siblings: ["siblings", "/synthetic/A", "name", "asc"],
+      picker: ["picker", "/synthetic/A"],
+      list: ["list", "/synthetic/A"],
+      unrelated: ["stat", "/elsewhere"],
+    }
+    for (const key of Object.values(cached)) queryClient.setQueryData(key, [])
+    afterChange(["/synthetic/a"])
+    return Object.fromEntries(
+      Object.entries(cached).map(([name, key]) => [
+        name,
+        queryClient.getQueryState(key)?.isInvalidated ?? null,
+      ])
+    )
+  })
+  expect(states).toEqual({
+    stat: true,
+    siblings: true,
+    picker: true,
+    list: true,
+    unrelated: false,
+  })
+})
+
+test("deleting a storage invalidates mount-scoped caches", async ({ page }) => {
+  await page.goto(server.origin + "/admin/storages")
+  await expect(page.getByText("1개 저장소", { exact: true })).toBeVisible()
+  const cachedKeys = [
+    ["list", "/synthetic"],
+    ["stat", "/synthetic"],
+    ["siblings", "/synthetic", "name", "asc"],
+    ["picker", "/synthetic"],
+  ]
+  await page.evaluate(async (keys) => {
+    const { queryClient } = await import("/src/lib/queries.ts")
+    for (const key of keys) queryClient.setQueryData(key, [])
+  }, cachedKeys)
+  await page.getByRole("button", { name: "/synthetic 삭제" }).click()
+  await page
+    .getByRole("alertdialog")
+    .getByRole("button", { name: "저장소 삭제", exact: true })
+    .click()
+  await expect(
+    page.getByText(
+      "아직 저장소가 없습니다. '저장소 추가'로 첫 Dropbox 계정을 연결하세요.",
+      { exact: true }
+    )
+  ).toBeVisible()
+  const states = await page.evaluate(async (keys) => {
+    const { queryClient } = await import("/src/lib/queries.ts")
+    return keys.map(
+      (key) => queryClient.getQueryState(key)?.isInvalidated ?? null
+    )
+  }, cachedKeys)
+  expect(states).toEqual([true, true, true, true])
+})
+

@@ -3,6 +3,7 @@ import { useCallback } from "react"
 
 import { api, type Entry } from "@/lib/api"
 import { urls } from "@/lib/api"
+import { isRelatedPath } from "@/lib/paths"
 import { subscribe } from "@/lib/sse"
 
 export const queryClient = new QueryClient({
@@ -46,24 +47,19 @@ export function useSearchRevision() {
 /**
  * After a rename/move/copy/delete: refetch the affected folder listings and forget
  * on-demand folder sizes of every ancestor and descendant of the changed paths.
+ * Every path-keyed cache is matched case-insensitively, because the backend resolves
+ * virtual paths that way.
  */
 export function afterChange(changed: string[]) {
   queryClient.setQueryData<number>(keys.searchRevision, (revision = 0) => revision + 1)
-  const isRelated = (a: string, b: string) => a === b || a.startsWith(b === "/" ? "/" : b + "/") || b.startsWith(a === "/" ? "/" : a + "/")
-  queryClient.removeQueries({
-    queryKey: ["fsize"],
-    predicate: (q) => {
-      const p = q.queryKey[1] as string
-      return changed.some((c) => isRelated(p, c))
-    },
-  })
-  queryClient.invalidateQueries({
-    queryKey: ["list"],
-    predicate: (q) => {
-      const p = q.queryKey[1] as string
-      return changed.some((c) => isRelated(p, c))
-    },
-  })
+  const related = (queryKey: readonly unknown[]) => {
+    const p = queryKey[1]
+    return typeof p === "string" && changed.some((c) => isRelatedPath(p, c))
+  }
+  queryClient.removeQueries({ queryKey: ["fsize"], predicate: (q) => related(q.queryKey) })
+  for (const key of ["list", "stat", "siblings", "picker"] as const) {
+    queryClient.invalidateQueries({ queryKey: [key], predicate: (q) => related(q.queryKey) })
+  }
 }
 
 export interface FolderSizeState {
