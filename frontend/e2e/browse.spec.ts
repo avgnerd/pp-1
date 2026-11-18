@@ -436,3 +436,43 @@ test("deleting a storage invalidates mount-scoped caches", async ({ page }) => {
   expect(states).toEqual([true, true, true, true])
 })
 
+test("dotfiles and unicode names keep their in-app preview route", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic")
+  await expect(link(page, ".env")).toHaveAttribute("href", "/synthetic/.env")
+  await expect(link(page, "İ.mp4")).toHaveAttribute(
+    "href",
+    "/synthetic/%C4%B0.mp4"
+  )
+  const kinds = await page.evaluate(async () => {
+    const format = await import("/src/lib/format.ts")
+    return {
+      env: format.extOf(".env"),
+      envKind: format.fileKind(".env"),
+      envPreview: format.hasPreview(".env", true),
+      gitignore: format.extOf(".gitignore"),
+      gitignoreKind: format.fileKind(".gitignore"),
+      unicode: format.extOf("İ.mp4"),
+      unicodeKind: format.fileKind("İ.mp4"),
+      unicodeThumb: format.thumbnailable("İ.jpg"),
+      tarGz: format.extOf("a.tar.gz"),
+      onlyDot: format.extOf("."),
+    }
+  })
+  expect(kinds).toEqual({
+    env: "env",
+    envKind: "text",
+    envPreview: true,
+    gitignore: "gitignore",
+    gitignoreKind: "other",
+    unicode: "mp4",
+    unicodeKind: "video",
+    unicodeThumb: true,
+    tarGz: "tar.gz",
+    onlyDot: "",
+  })
+  await page.goto(server.origin + "/download/synthetic/%C4%B0.mp4")
+  await expect(page.locator("dd").first()).toHaveText("MP4")
+})
+
