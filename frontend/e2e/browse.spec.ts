@@ -476,3 +476,32 @@ test("dotfiles and unicode names keep their in-app preview route", async ({
   await expect(page.locator("dd").first()).toHaveText("MP4")
 })
 
+test("out of range storage page canonicalizes to the last page", async ({
+  page,
+}) => {
+  server.setMounts([
+    {
+      id: 1,
+      name: "Synthetic 1",
+      mount_path: "/synthetic",
+      status: "active",
+      account_email: "synthetic@example.invalid",
+      account_name: "Synthetic",
+    },
+    {
+      id: 2,
+      name: "Synthetic 2",
+      mount_path: "/synthetic-two",
+      status: "active",
+      account_email: "second@example.invalid",
+      account_name: "Second",
+    },
+  ])
+  server.setConfig({ pagination_type: "pages", per_page: 1 })
+  await page.goto(server.origin + "/?page=99")
+  await expect(
+    page.getByText(/Synthetic 2 \(second@example\.invalid\)/)
+  ).toBeVisible()
+  await expect(page).toHaveURL(server.origin + "/?page=2")
+  await expect(page.getByText("2개", { exact: true })).toBeVisible()
+})

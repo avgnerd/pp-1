@@ -1,6 +1,6 @@
 import { Link, useNavigate, useSearch } from "@tanstack/react-router"
 import { HardDriveIcon, PlugZapIcon } from "lucide-react"
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
@@ -22,11 +22,18 @@ export function HomePage() {
   const [moreSteps, setMoreSteps] = useState(0)
 
   const all = useMemo(() => mounts.data ?? [], [mounts.data])
+  const pageCount = Math.max(1, Math.ceil(all.length / per))
+  const curPage = Math.min(page, pageCount)
+  // Same pagination rules as folders and search results: clamp, then canonicalize the URL.
+  useEffect(() => {
+    if (!mounts.isSuccess || !cfg.isSuccess || cfg.fetchStatus !== "idle" || type !== "pages" || page === curPage) return
+    navigate({ to: "/", search: { page: curPage > 1 ? curPage : undefined }, replace: true })
+  }, [mounts.isSuccess, cfg.isSuccess, cfg.fetchStatus, type, page, curPage, navigate])
   const visible = useMemo(() => {
     if (type === "all") return all
-    if (type === "pages") return all.slice((page - 1) * per, page * per)
+    if (type === "pages") return all.slice((curPage - 1) * per, curPage * per)
     return all.slice(0, per * (moreSteps + 1))
-  }, [all, type, page, per, moreSteps])
+  }, [all, type, curPage, per, moreSteps])
 
   if (mounts.isPending || cfg.isPending) {
     return (
@@ -93,8 +100,8 @@ export function HomePage() {
       </ul>
       <Pager
         type={type}
-        page={page}
-        pageCount={Math.max(1, Math.ceil(all.length / per))}
+        page={curPage}
+        pageCount={pageCount}
         onPage={(p) => navigate({ to: "/", search: { page: p > 1 ? p : undefined } })}
         hasMore={visible.length < all.length}
         loadMore={() => setMoreSteps((n) => n + 1)}
