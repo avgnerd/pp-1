@@ -22,6 +22,12 @@ import (
 // newTestService wires a real vfs service onto the in-memory fake Dropbox with one storage at /m.
 func newTestService(t *testing.T, appKey string) (*vfs.Service, *fake.Server) {
 	t.Helper()
+	return newTestServiceAt(t, appKey, "/")
+}
+
+// newTestServiceAt is newTestService with an explicit Dropbox root.
+func newTestServiceAt(t *testing.T, appKey, root string) (*vfs.Service, *fake.Server) {
+	t.Helper()
 	fs, fts := fake.NewServer()
 	t.Cleanup(fts.Close)
 	cfg, err := config.Load(testutil.TempDir(t))
@@ -45,7 +51,7 @@ func newTestService(t *testing.T, appKey string) (*vfs.Service, *fake.Server) {
 	}
 	c := cache.New(10_000, 64<<20, time.Minute)
 	t.Cleanup(c.Stop)
-	start, err := sm.Create(storage.Input{MountPath: "/m", AppKey: appKey, AppSecret: "s", AuthMode: storage.AuthCode})
+	start, err := sm.Create(storage.Input{MountPath: "/m", RootPath: root, AppKey: appKey, AppSecret: "s", AuthMode: storage.AuthCode})
 	if err != nil {
 		t.Fatal(err)
 	}
