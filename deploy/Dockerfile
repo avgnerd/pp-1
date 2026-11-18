@@ -1,7 +1,7 @@
 # Multi-stage build: frontend (Node) -> Go server (static, CGO off) -> Alpine runtime with FFmpeg.
 # Builds natively on linux/arm64 (Oracle Ampere A1) and linux/amd64.
 
-FROM node:24-alpine AS web
+FROM node:26-alpine AS web
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund

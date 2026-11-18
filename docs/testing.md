@@ -5,7 +5,7 @@
 ## 준비
 
 - Go 1.27.4 이상. `backend/go.mod`의 `go 1.27.4`를 따릅니다.
-- Node.js 20.19.x, 22.13 이상, 또는 24 이상. 설치된 `vite@8.3.5`는 `^20.19.0 || >=22.12.0`을, `eslint@10.14.0`은 `^20.19.0 || ^22.13.0 || >=24`를 요구합니다.
+- Node.js 20.19.x, 22.13 이상, 또는 24 이상. CI는 Node 26을 씁니다. 설치된 `vite@8.3.7`은 `^20.19.0 || >=22.12.0`을, `eslint@10.14.0`은 `^20.19.0 || ^22.13.0 || >=24`를 요구합니다.
 - Microsoft Edge. 세 Playwright 설정 모두 `channel: "msedge"`를 사용합니다.
 - libx264를 포함한 FFmpeg. streaming 설정이 `ffmpeg`로 H.264 영상과 HLS 세그먼트를 만듭니다. `ffmpeg`가 PATH에 없으면 `FFMPEG_PATH`를 지정합니다. `scripts/run-local.ps1`은 `tools\ffmpeg\bin\ffmpeg.exe`에 내려받습니다.
 
@@ -123,11 +123,13 @@ npx playwright test --config=playwright.browse.config.ts
 | --- | --- |
 | runner | `windows-2025` |
 | Go | `backend/go.mod`의 `go 1.27.4` |
-| Node.js | `24` |
+| Node.js | `26` |
 | 브라우저 | 이미지에 포함된 Microsoft Edge |
 | FFmpeg | `scripts/ci/prepare-ffmpeg.ps1`이 libx264를 포함한 빌드를 준비 |
 
-`windows-2025` 이미지에는 Edge와 Node.js 24가 있고 FFmpeg는 없습니다. Go 1.27.4와 FFmpeg는 CI가 직접 준비합니다. Windows runner 라벨은 [GitHub Docs의 runner 표](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)와 [Windows2025 이미지 목록](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md)을 따릅니다.
+`windows-2025` 이미지에는 Edge가 있고 FFmpeg는 없습니다. Node.js는 이미지에 포함된 버전을 쓰지 않고 `actions/setup-node`가 Node 26을 설치합니다. Go 1.27.4와 FFmpeg는 CI가 직접 준비합니다. Windows runner 라벨은 [GitHub Docs의 runner 표](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)와 [Windows2025 이미지 목록](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md)을 따릅니다.
+
+GitHub Docs 기준 공개 저장소의 표준 `windows-2025` runner는 4 vCPU와 16 GB 메모리를 제공합니다. `Show tool versions` 단계가 실제 논리 CPU 수와 총 메모리를 로그에 남기므로 실행마다 이 사양과 비교할 수 있습니다.
 
 workflow는 `actions/checkout@v7.0.1`, `actions/setup-go@v7.0.0`, `actions/setup-node@v7.1.0`, `actions/upload-artifact@v7.0.2`를 40자 commit SHA로 고정하고 `# v7.x.y` 주석으로 버전을 남깁니다. Dependabot은 이 주석을 보고 SHA를 갱신합니다.
 
