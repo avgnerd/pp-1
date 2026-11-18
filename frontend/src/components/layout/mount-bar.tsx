@@ -1,7 +1,7 @@
 import { Link, useLocation } from "@tanstack/react-router"
 
 import { cn } from "@/lib/utils"
-import { toSplat } from "@/lib/paths"
+import { decodePath, isWithin, toSplat } from "@/lib/paths"
 import { useMounts } from "@/lib/queries"
 
 /**
@@ -11,14 +11,14 @@ import { useMounts } from "@/lib/queries"
 export function MountBar() {
   const mounts = useMounts()
   const loc = useLocation()
-  const current = decodeURIComponent(loc.pathname)
+  const current = decodePath(loc.pathname)
   const list = mounts.data ?? []
   if (!list.length) return null
   return (
     <nav aria-label="마운트 경로" className="border-b bg-card/40">
       <ul className="mx-auto flex w-full max-w-6xl flex-wrap gap-x-1 gap-y-1 px-4 py-2">
         {list.map((m) => {
-          const active = current === m.mount_path || current.startsWith(m.mount_path + "/")
+          const active = isWithin(current, m.mount_path)
           return (
             <li key={m.id}>
               <Link

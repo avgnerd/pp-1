@@ -24,6 +24,28 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
     transcode: false,
     probe: false,
   }
+  const mount = (id, p) => ({
+    id,
+    name: "Synthetic " + id,
+    mount_path: p,
+    status: "active",
+    account_email: "synthetic@example.invalid",
+    account_name: "Synthetic",
+  })
+  let mounts = [mount(1, "/synthetic")]
+  let storages = [
+    {
+      ...mount(1, "/synthetic"),
+      root_path: "/",
+      app_key: "synthetic-key",
+      account_id: "dbid:synthetic",
+      cache_ttl_min: 30,
+      auth_mode: "localhost",
+      redirect_uri: "http://127.0.0.1/api/oauth/callback",
+    },
+  ]
+  const initialMounts = [...mounts]
+  const initialStorages = [...storages]
   const data = new Map([
     [
       "/synthetic",
@@ -35,9 +57,19 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
         entry("/synthetic/한글 #?%"),
         entry("/synthetic/raw#?%23.bin", "file"),
         entry("/synthetic/note#?%23.txt", "file"),
+        entry("/synthetic/.env", "file"),
+        entry("/synthetic/İ.mp4", "file"),
+        entry("/synthetic/gallery"),
         entry("/synthetic/pages"),
         entry("/synthetic/a"),
         entry("/synthetic/b"),
+      ],
+    ],
+    [
+      "/synthetic/gallery",
+      [
+        entry("/synthetic/gallery/#1 <b>tag.jpg", "file"),
+        entry("/synthetic/gallery/A <b>B & C.jpg", "file"),
       ],
     ],
     ["/synthetic/normal", [entry("/synthetic/normal/child")]],
@@ -84,17 +116,25 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
             if (u.pathname === "/api/auth/me")
               return json({ authenticated: true, username: "synthetic-user" })
             if (u.pathname === "/api/config") return json(config)
-            if (u.pathname === "/api/mounts")
-              return json([
-                {
-                  id: 1,
-                  name: "Synthetic",
-                  mount_path: "/synthetic",
-                  status: "active",
-                  account_email: "synthetic@example.invalid",
-                  account_name: "Synthetic",
-                },
-              ])
+            if (u.pathname === "/api/mounts") return json(mounts)
+            if (u.pathname === "/api/oauth-info")
+              return json({
+                localhost_redirect: "http://127.0.0.1/api/oauth/callback",
+                public_redirect: "",
+                scopes: [],
+              })
+            if (u.pathname === "/api/admin/storages") {
+              if (req.method === "GET") return json(storages)
+            }
+            if (
+              u.pathname.startsWith("/api/admin/storages/") &&
+              req.method === "DELETE"
+            ) {
+              const id = Number(u.pathname.split("/").at(-1))
+              storages = storages.filter((s) => s.id !== id)
+              mounts = mounts.filter((m) => m.id !== id)
+              return json({ ok: true })
+            }
             if (u.pathname === "/api/fs/stat") {
               const found = [...data.values()].flat().find((e) => e.path === p)
               return p === "/synthetic" || data.has(p) || found
@@ -174,11 +214,16 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
     reset: () => {
       for (const x of held.splice(0)) x.res.destroy()
       bMode = "ok"
+      mounts = [...initialMounts]
+      storages = [...initialStorages]
       data.clear()
       for (const [p, es] of initialData) data.set(p, [...es])
     },
     setConfig: (x) => {
       config = { ...config, ...x }
+    },
+    setMounts: (x) => {
+      mounts = x
     },
     setBMode: (x) => {
       bMode = x

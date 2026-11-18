@@ -36,6 +36,10 @@ const APP_CONSOLE = "https://www.dropbox.com/developers/apps"
 function refreshAll() {
   queryClient.invalidateQueries({ queryKey: ["storages"] })
   queryClient.invalidateQueries({ queryKey: keys.mounts })
+  // A storage change adds, moves, or removes a mount, so every path-keyed cache is stale.
+  for (const key of ["list", "stat", "siblings", "picker"]) {
+    queryClient.invalidateQueries({ queryKey: [key] })
+  }
 }
 
 export default function StoragesPage() {

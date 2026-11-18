@@ -22,7 +22,7 @@ import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
 import { api, type Entry, type OpResult } from "@/lib/api"
-import { baseName, joinPath, parentPath } from "@/lib/paths"
+import { baseName, isWithin, joinPath, parentPath, samePath } from "@/lib/paths"
 import { afterChange, useMounts } from "@/lib/queries"
 import { useSelection } from "@/stores/ui"
 
@@ -141,7 +141,7 @@ function DestinationPicker({ mode, entries, onClose }: { mode: "move" | "copy"; 
   const mounts = useMounts()
   const mountRoot = useMemo(() => {
     const first = entries[0]
-    return mounts.data?.find((m) => first.path === m.mount_path || first.path.startsWith(m.mount_path + "/"))?.mount_path ?? "/"
+    return mounts.data?.find((m) => isWithin(first.path, m.mount_path))?.mount_path ?? "/"
   }, [entries, mounts.data])
   const [dir, setDir] = useState(() => parentPath(entries[0].path))
   const [busy, setBusy] = useState(false)
@@ -183,7 +183,7 @@ function DestinationPicker({ mode, entries, onClose }: { mode: "move" | "copy"; 
         <DialogDescription>같은 저장소({mountRoot}) 안에서 대상 폴더를 고르세요.</DialogDescription>
       </DialogHeader>
       <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-        <Button variant="ghost" size="icon-sm" aria-label="상위 폴더" disabled={dir === mountRoot} onClick={() => setDir(parentPath(dir))}>
+        <Button variant="ghost" size="icon-sm" aria-label="상위 폴더" disabled={samePath(dir, mountRoot)} onClick={() => setDir(parentPath(dir))}>
           <ArrowUpIcon />
         </Button>
         <span className="min-w-0 flex-1 truncate text-sm" title={dir}>

@@ -317,3 +317,191 @@ test("same folder page transitions retain rows until the requested page arrives"
   await expect(link(page, "item031")).toBeVisible()
   await expect(link(page, "item001")).toHaveCount(0)
 })
+
+test("gallery caption keeps a leading dot or hash in the file name", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic/gallery")
+  await page
+    .getByRole("button", { name: "#1 <b>tag.jpg 원본 보기", exact: true })
+    .click()
+  await expect(page.locator(".lg-sub-html")).toHaveText("#1 <b>tag.jpg")
+})
+
+test("gallery caption keeps markup in the file name literal", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic/gallery")
+  await page
+    .getByRole("button", { name: "A <b>B & C.jpg 원본 보기", exact: true })
+    .click()
+  await expect(page.locator(".lg-sub-html")).toHaveText("A <b>B & C.jpg")
+})
+
+test("mount bar marks the active mount regardless of path case", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/SYNTHETIC/child")
+  await expect(
+    page.locator('nav[aria-label="마운트 경로"] a[aria-current="page"]')
+  ).toHaveText("/synthetic")
+})
+
+test("path helpers decode safely and compare case-insensitively", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic")
+  const result = await page.evaluate(async () => {
+    const paths = await import("/src/lib/paths.ts")
+    return {
+      malformed: paths.decodePath("/mount/100%_test"),
+      encoded: paths.decodePath("/mount/%ED%95%9C%EA%B8%80"),
+      inside: paths.isWithin("/SYNTHETIC/a", "/synthetic"),
+      outside: paths.isWithin("/other/a", "/synthetic"),
+      same: paths.samePath("/SYNTHETIC", "/synthetic"),
+      related: paths.isRelatedPath("/SYNTHETIC/a/b", "/synthetic/A"),
+    }
+  })
+  expect(result).toEqual({
+    malformed: "/mount/100%_test",
+    encoded: "/mount/한글",
+    inside: true,
+    outside: false,
+    same: true,
+    related: true,
+  })
+})
+
+test("file changes invalidate stat, siblings and picker caches case-insensitively", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic")
+  const states = await page.evaluate(async () => {
+    const { afterChange, queryClient } = await import("/src/lib/queries.ts")
+    const cached = {
+      stat: ["stat", "/synthetic/A/only-A"],
+      siblings: ["siblings", "/synthetic/A", "name", "asc"],
+      picker: ["picker", "/synthetic/A"],
+      list: ["list", "/synthetic/A"],
+      unrelated: ["stat", "/elsewhere"],
+    }
+    for (const key of Object.values(cached)) queryClient.setQueryData(key, [])
+    afterChange(["/synthetic/a"])
+    return Object.fromEntries(
+      Object.entries(cached).map(([name, key]) => [
+        name,
+        queryClient.getQueryState(key)?.isInvalidated ?? null,
+      ])
+    )
+  })
+  expect(states).toEqual({
+    stat: true,
+    siblings: true,
+    picker: true,
+    list: true,
+    unrelated: false,
+  })
+})
+
+test("deleting a storage invalidates mount-scoped caches", async ({ page }) => {
+  await page.goto(server.origin + "/admin/storages")
+  await expect(page.getByText("1개 저장소", { exact: true })).toBeVisible()
+  const cachedKeys = [
+    ["list", "/synthetic"],
+    ["stat", "/synthetic"],
+    ["siblings", "/synthetic", "name", "asc"],
+    ["picker", "/synthetic"],
+  ]
+  await page.evaluate(async (keys) => {
+    const { queryClient } = await import("/src/lib/queries.ts")
+    for (const key of keys) queryClient.setQueryData(key, [])
+  }, cachedKeys)
+  await page.getByRole("button", { name: "/synthetic 삭제" }).click()
+  await page
+    .getByRole("alertdialog")
+    .getByRole("button", { name: "저장소 삭제", exact: true })
+    .click()
+  await expect(
+    page.getByText(
+      "아직 저장소가 없습니다. '저장소 추가'로 첫 Dropbox 계정을 연결하세요.",
+      { exact: true }
+    )
+  ).toBeVisible()
+  const states = await page.evaluate(async (keys) => {
+    const { queryClient } = await import("/src/lib/queries.ts")
+    return keys.map(
+      (key) => queryClient.getQueryState(key)?.isInvalidated ?? null
+    )
+  }, cachedKeys)
+  expect(states).toEqual([true, true, true, true])
+})
+
+test("dotfiles and unicode names keep their in-app preview route", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic")
+  await expect(link(page, ".env")).toHaveAttribute("href", "/synthetic/.env")
+  await expect(link(page, "İ.mp4")).toHaveAttribute(
+    "href",
+    "/synthetic/%C4%B0.mp4"
+  )
+  const kinds = await page.evaluate(async () => {
+    const format = await import("/src/lib/format.ts")
+    return {
+      env: format.extOf(".env"),
+      envKind: format.fileKind(".env"),
+      envPreview: format.hasPreview(".env", true),
+      gitignore: format.extOf(".gitignore"),
+      gitignoreKind: format.fileKind(".gitignore"),
+      unicode: format.extOf("İ.mp4"),
+      unicodeKind: format.fileKind("İ.mp4"),
+      unicodeThumb: format.thumbnailable("İ.jpg"),
+      tarGz: format.extOf("a.tar.gz"),
+      onlyDot: format.extOf("."),
+    }
+  })
+  expect(kinds).toEqual({
+    env: "env",
+    envKind: "text",
+    envPreview: true,
+    gitignore: "gitignore",
+    gitignoreKind: "other",
+    unicode: "mp4",
+    unicodeKind: "video",
+    unicodeThumb: true,
+    tarGz: "tar.gz",
+    onlyDot: "",
+  })
+  await page.goto(server.origin + "/download/synthetic/%C4%B0.mp4")
+  await expect(page.locator("dd").first()).toHaveText("MP4")
+})
+
+test("out of range storage page canonicalizes to the last page", async ({
+  page,
+}) => {
+  server.setMounts([
+    {
+      id: 1,
+      name: "Synthetic 1",
+      mount_path: "/synthetic",
+      status: "active",
+      account_email: "synthetic@example.invalid",
+      account_name: "Synthetic",
+    },
+    {
+      id: 2,
+      name: "Synthetic 2",
+      mount_path: "/synthetic-two",
+      status: "active",
+      account_email: "second@example.invalid",
+      account_name: "Second",
+    },
+  ])
+  server.setConfig({ pagination_type: "pages", per_page: 1 })
+  await page.goto(server.origin + "/?page=99")
+  await expect(
+    page.getByText(/Synthetic 2 \(second@example\.invalid\)/)
+  ).toBeVisible()
+  await expect(page).toHaveURL(server.origin + "/?page=2")
+  await expect(page.getByText("2개", { exact: true })).toBeVisible()
+})

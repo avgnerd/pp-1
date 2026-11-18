@@ -39,9 +39,10 @@ export function formatDuration(sec: number): string {
 }
 
 export function extOf(name: string): string {
-  const i = name.lastIndexOf(".")
-  if (i <= 0 || i === name.length - 1) return ""
+  // Find the dot in the lowercased name: toLowerCase can change the length (e.g. "İ").
   const lower = name.toLowerCase()
+  const i = lower.lastIndexOf(".")
+  if (i < 0 || i === lower.length - 1) return ""
   if (lower.endsWith(".tar.gz")) return "tar.gz"
   return lower.slice(i + 1)
 }
