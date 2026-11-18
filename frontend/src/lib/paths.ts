@@ -26,6 +26,32 @@ export function fromSplat(s: string | undefined): string {
   return "/" + s.replace(/^\/+/, "").replace(/\/+$/, "")
 }
 
+/** Percent-decodes a pathname, returning it unchanged when the escapes are malformed. */
+export function decodePath(p: string): string {
+  try {
+    return decodeURIComponent(p)
+  } catch {
+    return p
+  }
+}
+
+/** Case-insensitive equality for virtual paths. */
+export function samePath(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase()
+}
+
+/** Case-insensitive: p is root or sits below it. */
+export function isWithin(p: string, root: string): boolean {
+  const a = p.toLowerCase()
+  const b = root.toLowerCase()
+  return b === "/" ? a.startsWith("/") : a === b || a.startsWith(b + "/")
+}
+
+/** Case-insensitive: equal, or one path contains the other. */
+export function isRelatedPath(a: string, b: string): boolean {
+  return isWithin(a, b) || isWithin(b, a)
+}
+
 /** Percent-encodes each segment so the URL survives copy/paste and spaces or # in names. */
 export function encodePath(p: string): string {
   return p

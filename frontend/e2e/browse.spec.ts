@@ -338,3 +338,37 @@ test("gallery caption keeps markup in the file name literal", async ({
   await expect(page.locator(".lg-sub-html")).toHaveText("A <b>B & C.jpg")
 })
 
+test("mount bar marks the active mount regardless of path case", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/SYNTHETIC/child")
+  await expect(
+    page.locator('nav[aria-label="마운트 경로"] a[aria-current="page"]')
+  ).toHaveText("/synthetic")
+})
+
+test("path helpers decode safely and compare case-insensitively", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic")
+  const result = await page.evaluate(async () => {
+    const paths = await import("/src/lib/paths.ts")
+    return {
+      malformed: paths.decodePath("/mount/100%_test"),
+      encoded: paths.decodePath("/mount/%ED%95%9C%EA%B8%80"),
+      inside: paths.isWithin("/SYNTHETIC/a", "/synthetic"),
+      outside: paths.isWithin("/other/a", "/synthetic"),
+      same: paths.samePath("/SYNTHETIC", "/synthetic"),
+      related: paths.isRelatedPath("/SYNTHETIC/a/b", "/synthetic/A"),
+    }
+  })
+  expect(result).toEqual({
+    malformed: "/mount/100%_test",
+    encoded: "/mount/한글",
+    inside: true,
+    outside: false,
+    same: true,
+    related: true,
+  })
+})
+
