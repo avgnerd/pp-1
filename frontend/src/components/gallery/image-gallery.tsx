@@ -63,7 +63,8 @@ export default function ImageGallery({ images, index, onIndexChange, onClose }: 
         thumb: urls.thumb(e.path, e.rev, "w128h128"),
         lgSize: lgSizeFor(e.path),
         alt: e.name,
-        subHtml: e.name,
+        // @lightgallery/react 3 renders caption as React text; subHtml is ignored by its renderer.
+        caption: e.name,
       })),
     // Ratios are read when the slide list is built, i.e. when the gallery opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps

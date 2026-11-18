@@ -97,19 +97,25 @@ func cacheName(storageID int64, dbxPath, rev, size string) string {
 }
 
 // Get returns JPEG thumbnail bytes for a file. rev keys the cache so edits produce new thumbnails.
+// Without rev the request says nothing about the content, and the same storage id and path can
+// name a different account or version after a restore, so such a request is neither read from the
+// disk cache nor stored in it.
 func (s *Service) Get(ctx context.Context, storageID int64, dbxPath, rev, size string) ([]byte, error) {
 	if !Sizes[size] {
 		size = "w256h256"
 	}
 	name := cacheName(storageID, dbxPath, rev, size)
-	if b, err := os.ReadFile(filepath.Join(s.dir, name)); err == nil {
-		s.diskMu.Lock()
-		if fi, ok := s.files[name]; ok {
-			fi.access = time.Now()
-			s.files[name] = fi
+	cacheable := rev != ""
+	if cacheable {
+		if b, err := os.ReadFile(filepath.Join(s.dir, name)); err == nil {
+			s.diskMu.Lock()
+			if fi, ok := s.files[name]; ok {
+				fi.access = time.Now()
+				s.files[name] = fi
+			}
+			s.diskMu.Unlock()
+			return b, nil
 		}
-		s.diskMu.Unlock()
-		return b, nil
 	}
 	ch := make(chan result, 1)
 	key := fmt.Sprintf("%d|%s", storageID, size)
@@ -132,7 +138,9 @@ func (s *Service) Get(ctx context.Context, storageID int64, dbxPath, rev, size s
 		if r.err != nil {
 			return nil, r.err
 		}
-		s.store(name, r.data)
+		if cacheable {
+			s.store(name, r.data)
+		}
 		return r.data, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()

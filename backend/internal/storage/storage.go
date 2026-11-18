@@ -69,6 +69,31 @@ func NormalizeMountPath(p string) (string, error) {
 	return pathutil.NormalizeMount(p)
 }
 
+// NormalizeRootPath validates and normalizes a storage's Dropbox source folder ("/" for the whole
+// account). It is the same rule Create and Update apply, exported for restore validation.
+func NormalizeRootPath(p string) (string, error) {
+	return pathutil.NormalizeRoot(p)
+}
+
+// ValidateCacheTTLMin checks the cache TTL range Create and Update enforce, so a restore applies
+// the same rule instead of keeping an unusable value.
+func ValidateCacheTTLMin(min int) error {
+	if min < 1 || min > 10080 {
+		return &ValidationError{Field: "cache_ttl_min", Msg: "캐시 만료 시간은 1~10080분이어야 합니다"}
+	}
+	return nil
+}
+
+// ValidateAuthMode checks the authorization modes Create and Reauth accept. Empty is the legacy
+// default a restore fills in as localhost.
+func ValidateAuthMode(mode string) error {
+	switch mode {
+	case "", AuthLocalhost, AuthPublic, AuthCode:
+		return nil
+	}
+	return &ValidationError{Field: "auth_mode", Msg: "인증 방식이 올바르지 않습니다"}
+}
+
 // Input is the admin form for creating or editing a storage.
 type Input struct {
 	Name        string `json:"name"`
@@ -491,7 +516,7 @@ func (m *Manager) Create(in Input) (*AuthStart, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := pathutil.NormalizeRoot(in.RootPath)
+	root, err := NormalizeRootPath(in.RootPath)
 	if err != nil {
 		return nil, &ValidationError{Field: "root_path", Msg: err.Error()}
 	}
@@ -506,8 +531,8 @@ func (m *Manager) Create(in Input) (*AuthStart, error) {
 	if in.CacheTTLMin == 0 {
 		in.CacheTTLMin = 30
 	}
-	if in.CacheTTLMin < 1 || in.CacheTTLMin > 10080 {
-		return nil, &ValidationError{Field: "cache_ttl_min", Msg: "캐시 만료 시간은 1~10080분이어야 합니다"}
+	if err := ValidateCacheTTLMin(in.CacheTTLMin); err != nil {
+		return nil, err
 	}
 	if in.AuthMode == "" {
 		in.AuthMode = AuthLocalhost
@@ -835,12 +860,12 @@ func (m *Manager) Update(id int64, in Input) (Storage, error) {
 	if err != nil {
 		return Storage{}, err
 	}
-	root, err := pathutil.NormalizeRoot(in.RootPath)
+	root, err := NormalizeRootPath(in.RootPath)
 	if err != nil {
 		return Storage{}, &ValidationError{Field: "root_path", Msg: err.Error()}
 	}
-	if in.CacheTTLMin < 1 || in.CacheTTLMin > 10080 {
-		return Storage{}, &ValidationError{Field: "cache_ttl_min", Msg: "캐시 만료 시간은 1~10080분이어야 합니다"}
+	if err := ValidateCacheTTLMin(in.CacheTTLMin); err != nil {
+		return Storage{}, err
 	}
 	if _, err := m.db.Exec(`UPDATE storages SET name = ?, mount_path = ?, root_path = ?, cache_ttl_min = ?, updated_at = ? WHERE id = ?`,
 		strings.TrimSpace(in.Name), mount, root, in.CacheTTLMin, m.now().Unix(), id); err != nil {

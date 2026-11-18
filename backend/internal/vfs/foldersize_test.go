@@ -18,13 +18,24 @@ import (
 // newTestService wires a real service onto the in-memory fake Dropbox with one storage at /m.
 func newTestService(t *testing.T, appKey string) (*Service, *fake.Server, *cache.Cache) {
 	t.Helper()
+	return newTestServiceWith(t, appKey, nil)
+}
+
+// newTestServiceWith is newTestService with apiBase choosing the Dropbox API host from the fake's
+// own URL, so a test can put a proxy in front of it and hold or fail individual calls.
+func newTestServiceWith(t *testing.T, appKey string, apiBase func(fakeURL string) string) (*Service, *fake.Server, *cache.Cache) {
+	t.Helper()
 	fs, fts := fake.NewServer()
 	t.Cleanup(fts.Close)
+	base := fts.URL
+	if apiBase != nil {
+		base = apiBase(fts.URL)
+	}
 	cfg, err := config.Load(testutil.TempDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.DropboxAPIBase, cfg.DropboxContentBase = fts.URL, fts.URL
+	cfg.DropboxAPIBase, cfg.DropboxContentBase = base, base
 	cfg.DropboxAuthorize, cfg.DropboxTokenURL = fts.URL+"/oauth2/authorize", fts.URL+"/oauth2/token"
 	d, err := db.Open(cfg.DataDir)
 	if err != nil {

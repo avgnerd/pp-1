@@ -63,6 +63,29 @@ func ValidatePayload(p *Payload) error {
 		default:
 			mounts = append(mounts, mountPoint{name: storageLabel(rec), path: norm})
 		}
+		// A backup stores what Create and Update wrote, so a root that differs from its own
+		// normalization would restore a value the listing cannot use. Empty means the legacy
+		// default ("/"), which ApplyTx fills in.
+		if rec.RootPath != "" {
+			norm, err := storage.NormalizeRootPath(rec.RootPath)
+			switch {
+			case err != nil:
+				errs = append(errs, label+": 루트 경로가 올바르지 않습니다 ("+err.Error()+")")
+			case norm != rec.RootPath:
+				errs = append(errs, fmt.Sprintf("%s: 루트 경로 '%s'가 정규화된 '%s'와 다릅니다", label, rec.RootPath, norm))
+			}
+		}
+		// Zero and empty are what a backup written before the defaults were stored carries;
+		// ApplyTx replaces them with 30 minutes and localhost, so only an explicit out-of-range
+		// or unknown value is rejected.
+		if rec.CacheTTLMin != 0 {
+			if err := storage.ValidateCacheTTLMin(rec.CacheTTLMin); err != nil {
+				errs = append(errs, label+": "+err.Error())
+			}
+		}
+		if err := storage.ValidateAuthMode(rec.AuthMode); err != nil {
+			errs = append(errs, label+": "+err.Error())
+		}
 		switch rec.Status {
 		case storage.StatusActive, storage.StatusPending, storage.StatusError:
 		default:

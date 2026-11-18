@@ -55,6 +55,7 @@ type Server struct {
 	rpcCount       atomic.Int64
 	ExpireTokens   atomic.Bool // when true the next request with any token gets 401 once
 	PageSize       int         // list_folder page size (default 2000)
+	SearchPageSize int         // search page size; 0 returns every match in one page
 	Latency        time.Duration
 	FailAccounts   sync.Map // app key -> true: every RPC returns 500
 }
@@ -414,6 +415,13 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
+		// Dropbox rejects any byte range on an empty file with 416. http.ServeContent ignores the
+		// range for a zero-length body and answers 200, so model the real server explicitly.
+		if r.Header.Get("Range") != "" && len(n.Data) == 0 {
+			w.Header().Set("Content-Range", "bytes */0")
+			writeErr(w, http.StatusRequestedRangeNotSatisfiable, "unsatisfiable_range")
+			return
+		}
 		http.ServeContent(w, r, n.Name, n.Modified, bytes.NewReader(n.Data))
 	case "files/get_thumbnail_batch":
 		es, _ := arg["entries"].([]any)
@@ -437,14 +445,23 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	case "files/search_v2", "files/search/continue_v2":
 		q := strings.ToLower(str("query"))
 		scope := ""
-		if opts, ok := arg["options"].(map[string]any); ok {
-			if p, ok := opts["path"].(string); ok {
-				scope = strings.ToLower(p)
+		offset := 0
+		if ep == "files/search_v2" {
+			if opts, ok := arg["options"].(map[string]any); ok {
+				if p, ok := opts["path"].(string); ok {
+					scope = strings.ToLower(p)
+				}
 			}
-		}
-		if ep == "files/search/continue_v2" {
-			writeJSON(w, map[string]any{"matches": []any{}, "has_more": false})
-			return
+		} else {
+			c, _ := base64.RawURLEncoding.DecodeString(str("cursor"))
+			parts := strings.SplitN(string(c), "|", 3)
+			if len(parts) != 3 {
+				writeErr(w, 409, "reset")
+				return
+			}
+			offset, _ = strconv.Atoi(parts[0])
+			q, _ = url.QueryUnescape(parts[1])
+			scope, _ = url.QueryUnescape(parts[2])
 		}
 		matches := []map[string]any{}
 		keys := make([]string, 0, len(acct.nodes))
@@ -459,6 +476,19 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(strings.ToLower(acct.nodes[k].Name), q) {
 				matches = append(matches, map[string]any{"metadata": map[string]any{".tag": "metadata", "metadata": acct.meta(k)}})
 			}
+		}
+		if s.SearchPageSize > 0 {
+			// A paged search is how a test fills a stream's buffers without hundreds of accounts.
+			end := offset + s.SearchPageSize
+			if end > len(matches) {
+				end = len(matches)
+			}
+			if offset > len(matches) {
+				offset = len(matches)
+			}
+			cursor := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d|%s|%s", end, url.QueryEscape(q), url.QueryEscape(scope))))
+			writeJSON(w, map[string]any{"matches": matches[offset:end], "cursor": cursor, "has_more": end < len(matches)})
+			return
 		}
 		writeJSON(w, map[string]any{"matches": matches, "has_more": false})
 	case "files/move_v2", "files/copy_v2":

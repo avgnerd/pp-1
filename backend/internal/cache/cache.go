@@ -7,6 +7,7 @@ package cache
 
 import (
 	"container/list"
+	"context"
 	"hash/fnv"
 	"strings"
 	"sync"
@@ -17,6 +18,10 @@ import (
 )
 
 const shardCount = 32
+
+// defaultLoadTimeout bounds a shared load whose caller passed no usable timeout. It matches the
+// ceiling the archive preview has always used for one archive read.
+const defaultLoadTimeout = 2 * time.Minute
 
 type entry struct {
 	key     string
@@ -200,22 +205,38 @@ func (c *Cache) Clear() {
 
 // GetOrLoad returns the cached value or calls load once per key across concurrent callers.
 // load returns the value, its estimated size, and its TTL (ttl <= 0 means "do not cache").
-func (c *Cache) GetOrLoad(key string, load func() (any, int64, time.Duration, error)) (any, error) {
+//
+// The load runs on its own context bounded by timeout, so it outlives the caller that started
+// it: one caller going away neither fails the load for the callers waiting on the same key nor
+// keeps that caller blocked until the load ends. load must use the context it is given.
+func (c *Cache) GetOrLoad(ctx context.Context, key string, timeout time.Duration, load func(context.Context) (any, int64, time.Duration, error)) (any, error) {
 	if v, ok := c.Get(key); ok {
 		return v, nil
 	}
-	v, err, _ := c.sf.Do(key, func() (any, error) {
+	if timeout <= 0 {
+		// A zero deadline would cancel the load at once; an unbounded one could outlive every
+		// caller. Bound it either way.
+		timeout = defaultLoadTimeout
+	}
+	ch := c.sf.DoChan(key, func() (any, error) {
 		if v, ok := c.Get(key); ok {
 			return v, nil
 		}
-		val, size, ttl, err := load()
+		lctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		val, size, ttl, err := load(lctx)
 		if err != nil {
 			return nil, err
 		}
 		c.Set(key, val, size, ttl)
 		return val, nil
 	})
-	return v, err
+	select {
+	case r := <-ch:
+		return r.Val, r.Err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // Stats returns counters and current usage.

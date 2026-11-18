@@ -63,18 +63,17 @@ func Expand(ctx context.Context, svc *vfs.Service, vpaths []string, maxFiles int
 		if err != nil {
 			return fmt.Errorf("%s: %w", st.MountPath, err)
 		}
-		base := strings.ToLower(dbx)
-		if base == "/" {
-			base = ""
-		}
 		return c.ListFolder(ctx, dbx, true, func(es []dropbox.Metadata) error {
 			for _, e := range es {
 				if e.Tag != "file" {
 					continue
 				}
+				// The prefix test is case-insensitive, but the offset must be counted in path
+				// segments: lower-casing can change the UTF-8 byte length, so a byte offset into
+				// PathDisplay would cut inside a character or run past its end.
 				rel := e.PathDisplay
-				if len(e.PathLower) >= len(base) && strings.HasPrefix(e.PathLower, base) {
-					rel = e.PathDisplay[len(base):]
+				if pathutil.HasPrefix(e.PathDisplay, dbx) {
+					rel = pathutil.Rel(e.PathDisplay, dbx)
 				}
 				if err := add(File{StorageID: st.ID, DbxPath: e.PathLower, ZipName: path.Join(prefix, strings.TrimPrefix(rel, "/")),
 					Size: e.Size, Modified: e.Modified()}); err != nil {

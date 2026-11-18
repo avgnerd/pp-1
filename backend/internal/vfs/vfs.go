@@ -97,9 +97,13 @@ func listKey(id int64, dbx string) string        { return fmt.Sprintf("s:%d:list
 func FolderSizeKey(id int64, dbx string) string  { return fmt.Sprintf("s:%d:fsize:%s", id, strings.ToLower(dbx)) }
 func TempLinkKey(id int64, dbx string) string    { return fmt.Sprintf("s:%d:tl:%s", id, strings.ToLower(dbx)) }
 
+// listLoadTimeout bounds a listing that outlives its callers. A folder can span many pages, so it
+// is longer than stream's 30s single RPC, and it matches the archive preview's two-minute cap.
+const listLoadTimeout = 2 * time.Minute
+
 // listDropbox returns the cached, complete listing of a Dropbox folder.
 func (s *Service) listDropbox(ctx context.Context, st storage.Storage, dbx string) ([]dropbox.Metadata, error) {
-	v, err := s.Cache.GetOrLoad(listKey(st.ID, dbx), func() (any, int64, time.Duration, error) {
+	v, err := s.Cache.GetOrLoad(ctx, listKey(st.ID, dbx), listLoadTimeout, func(ctx context.Context) (any, int64, time.Duration, error) {
 		c, err := s.St.Client(st.ID)
 		if err != nil {
 			return nil, 0, 0, err
@@ -295,13 +299,15 @@ func (s *Service) SiblingFiles(ctx context.Context, vpath, sortBy, order string)
 // the listing of its parent and of itself, folder sizes of itself, its descendants and every
 // ancestor, and temporary links under it.
 func (s *Service) InvalidatePath(id int64, dbx string) {
-	lower := strings.ToLower(dbx)
-	s.Cache.Delete(listKey(id, dbx))
-	s.Cache.DeletePrefix(listKey(id, lower) + "/")
-	s.Cache.Delete(FolderSizeKey(id, dbx))
-	s.Cache.DeletePrefix(FolderSizeKey(id, lower) + "/")
-	s.Cache.Delete(TempLinkKey(id, dbx))
-	s.Cache.DeletePrefix(TempLinkKey(id, lower) + "/")
+	list := listKey(id, dbx)
+	s.Cache.Delete(list)
+	s.Cache.DeletePrefix(descendantPrefix(list))
+	fsize := FolderSizeKey(id, dbx)
+	s.Cache.Delete(fsize)
+	s.Cache.DeletePrefix(descendantPrefix(fsize))
+	tl := TempLinkKey(id, dbx)
+	s.Cache.Delete(tl)
+	s.Cache.DeletePrefix(descendantPrefix(tl))
 	for p := pathutil.Parent(dbx); ; p = pathutil.Parent(p) {
 		s.Cache.Delete(FolderSizeKey(id, p))
 		if p == pathutil.Parent(dbx) {
@@ -312,6 +318,10 @@ func (s *Service) InvalidatePath(id int64, dbx string) {
 		}
 	}
 }
+
+// descendantPrefix matches every key below parent. Trimming keeps the root's trailing slash from
+// becoming a double slash ("s:1:list://"), which matches no key.
+func descendantPrefix(parent string) string { return strings.TrimSuffix(parent, "/") + "/" }
 
 // FlushStorage drops every cache entry for a storage.
 func (s *Service) FlushStorage(id int64) { s.Cache.DeletePrefix(StoragePrefix(id)) }
