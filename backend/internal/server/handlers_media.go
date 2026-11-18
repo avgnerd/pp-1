@@ -92,13 +92,16 @@ func (s *Server) probe(c *gin.Context) {
 		}
 		link = l
 	}
+	// Both branches report the same availability: the player decides whether it can offer
+	// transcode from this flag, whether or not ffprobe answered.
+	transcode := s.HLS.Available() && s.Settings.Get().TranscodeConcurrency > 0
 	pr, err := s.Prober.Probe(ctx, e.ID, e.Rev, e.Name, link)
 	if err != nil {
 		// Probing failure should not block original playback.
-		c.JSON(200, gin.H{"probe": media.Probe{VR: media.DetectVRName(e.Name)}, "probe_error": err.Error(), "transcode": s.HLS.Available()})
+		c.JSON(200, gin.H{"probe": media.Probe{VR: media.DetectVRName(e.Name)}, "probe_error": err.Error(), "transcode": transcode})
 		return
 	}
-	c.JSON(200, gin.H{"probe": pr, "transcode": s.HLS.Available() && s.Settings.Get().TranscodeConcurrency > 0})
+	c.JSON(200, gin.H{"probe": pr, "transcode": transcode})
 }
 
 func (s *Server) hlsOpen(c *gin.Context) {

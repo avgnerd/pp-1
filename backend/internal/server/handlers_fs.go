@@ -230,6 +230,12 @@ func (s *Server) text(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// A byte range of a zero-length file is unsatisfiable at Dropbox (416); there is nothing to
+	// download and the preview is simply empty text, encoded as decodeText reports for no bytes.
+	if e.Size != nil && *e.Size == 0 {
+		c.JSON(200, gin.H{"text": "", "encoding": "utf-8", "truncated": false, "size": 0})
+		return
+	}
 	cl, err := s.St.Client(t.Storage.ID)
 	if err != nil {
 		fail(c, err)

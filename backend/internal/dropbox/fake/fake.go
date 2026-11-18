@@ -415,6 +415,13 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
+		// Dropbox rejects any byte range on an empty file with 416. http.ServeContent ignores the
+		// range for a zero-length body and answers 200, so model the real server explicitly.
+		if r.Header.Get("Range") != "" && len(n.Data) == 0 {
+			w.Header().Set("Content-Range", "bytes */0")
+			writeErr(w, http.StatusRequestedRangeNotSatisfiable, "unsatisfiable_range")
+			return
+		}
 		http.ServeContent(w, r, n.Name, n.Modified, bytes.NewReader(n.Data))
 	case "files/get_thumbnail_batch":
 		es, _ := arg["entries"].([]any)

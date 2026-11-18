@@ -518,6 +518,11 @@ func TestValidatePayloadRejectsBadPayloads(t *testing.T) {
 		{"active without secret", func(p *Payload) { p.Storages[0].AppSecret = "" }, "app_secret"},
 		{"active without token", func(p *Payload) { p.Storages[0].RefreshToken = "" }, "refresh_token"},
 		{"active without app key", func(p *Payload) { p.Storages[0].AppKey = "" }, "app_key"},
+		{"unnormalized root path", func(p *Payload) { p.Storages[0].RootPath = "/sub/" }, "루트 경로"},
+		{"relative root path", func(p *Payload) { p.Storages[0].RootPath = "sub" }, "루트 경로"},
+		{"cache ttl below range", func(p *Payload) { p.Storages[0].CacheTTLMin = -99 }, "캐시"},
+		{"cache ttl above range", func(p *Payload) { p.Storages[0].CacheTTLMin = 10081 }, "캐시"},
+		{"unknown auth mode", func(p *Payload) { p.Storages[0].AuthMode = "invalid_mode" }, "인증 방식"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -532,6 +537,22 @@ func TestValidatePayloadRejectsBadPayloads(t *testing.T) {
 				t.Fatalf("message %q does not mention %q", ve.Msg, tc.wantSub)
 			}
 		})
+	}
+}
+
+// TestValidatePayloadAcceptsLegacyStorageDefaults is the compatibility contract for a backup
+// written before the storage defaults were stored in the row: a missing root path, a zero cache
+// TTL and an empty auth mode are filled in by ApplyTx, so validation must not reject them.
+func TestValidatePayloadAcceptsLegacyStorageDefaults(t *testing.T) {
+	p := validPayload(t)
+	p.Storages[0].RootPath = ""
+	p.Storages[0].CacheTTLMin = 0
+	p.Storages[0].AuthMode = ""
+	p.Storages[1].RootPath = "/sub"
+	p.Storages[1].CacheTTLMin = 10080
+	p.Storages[1].AuthMode = "code"
+	if err := ValidatePayload(p); err != nil {
+		t.Fatalf("legacy storage defaults rejected: %v", err)
 	}
 }
 
