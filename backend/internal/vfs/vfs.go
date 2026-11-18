@@ -295,13 +295,15 @@ func (s *Service) SiblingFiles(ctx context.Context, vpath, sortBy, order string)
 // the listing of its parent and of itself, folder sizes of itself, its descendants and every
 // ancestor, and temporary links under it.
 func (s *Service) InvalidatePath(id int64, dbx string) {
-	lower := strings.ToLower(dbx)
-	s.Cache.Delete(listKey(id, dbx))
-	s.Cache.DeletePrefix(listKey(id, lower) + "/")
-	s.Cache.Delete(FolderSizeKey(id, dbx))
-	s.Cache.DeletePrefix(FolderSizeKey(id, lower) + "/")
-	s.Cache.Delete(TempLinkKey(id, dbx))
-	s.Cache.DeletePrefix(TempLinkKey(id, lower) + "/")
+	list := listKey(id, dbx)
+	s.Cache.Delete(list)
+	s.Cache.DeletePrefix(descendantPrefix(list))
+	fsize := FolderSizeKey(id, dbx)
+	s.Cache.Delete(fsize)
+	s.Cache.DeletePrefix(descendantPrefix(fsize))
+	tl := TempLinkKey(id, dbx)
+	s.Cache.Delete(tl)
+	s.Cache.DeletePrefix(descendantPrefix(tl))
 	for p := pathutil.Parent(dbx); ; p = pathutil.Parent(p) {
 		s.Cache.Delete(FolderSizeKey(id, p))
 		if p == pathutil.Parent(dbx) {
@@ -312,6 +314,10 @@ func (s *Service) InvalidatePath(id int64, dbx string) {
 		}
 	}
 }
+
+// descendantPrefix matches every key below parent. Trimming keeps the root's trailing slash from
+// becoming a double slash ("s:1:list://"), which matches no key.
+func descendantPrefix(parent string) string { return strings.TrimSuffix(parent, "/") + "/" }
 
 // FlushStorage drops every cache entry for a storage.
 func (s *Service) FlushStorage(id int64) { s.Cache.DeletePrefix(StoragePrefix(id)) }
