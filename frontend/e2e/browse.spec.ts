@@ -317,3 +317,24 @@ test("same folder page transitions retain rows until the requested page arrives"
   await expect(link(page, "item031")).toBeVisible()
   await expect(link(page, "item001")).toHaveCount(0)
 })
+
+test("gallery caption keeps a leading dot or hash in the file name", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic/gallery")
+  await page
+    .getByRole("button", { name: "#1 <b>tag.jpg 원본 보기", exact: true })
+    .click()
+  await expect(page.locator(".lg-sub-html")).toHaveText("#1 <b>tag.jpg")
+})
+
+test("gallery caption keeps markup in the file name literal", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic/gallery")
+  await page
+    .getByRole("button", { name: "A <b>B & C.jpg 원본 보기", exact: true })
+    .click()
+  await expect(page.locator(".lg-sub-html")).toHaveText("A <b>B & C.jpg")
+})
+
