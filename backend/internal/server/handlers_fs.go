@@ -285,6 +285,26 @@ func (s *Server) officePreview(c *gin.Context) {
 	c.DataFromReader(200, resp.ContentLength, ct, resp.Body, nil)
 }
 
+// archiveLoadTimeout bounds an archive read that outlives its callers, the same two minutes this
+// handler gave the read while it ran on the request context.
+const archiveLoadTimeout = 2 * time.Minute
+
+// archiveLoadError keeps a provider, storage or cancellation failure's own status instead of
+// reporting it as the caller's bad request. The archive package reports a parse failure as a
+// plain wrapped error, so the known failures are the ones named here.
+func archiveLoadError(err error) error {
+	var de *dropbox.APIError
+	switch {
+	case errors.Is(err, dropbox.ErrReauth),
+		errors.Is(err, storage.ErrRestoreInProgress),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.As(err, &de):
+		return err
+	}
+	return badRequest(err.Error())
+}
+
 func (s *Server) archiveList(c *gin.Context) {
 	st := s.Settings.Get()
 	if !st.ArchivePreview {
@@ -301,9 +321,7 @@ func (s *Server) archiveList(c *gin.Context) {
 		return
 	}
 	key := fmt.Sprintf("s:%d:arc:%s:%s", t.Storage.ID, strings.ToLower(t.DbxPath), e.Rev)
-	v, err := s.Cache.GetOrLoad(key, func() (any, int64, time.Duration, error) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
-		defer cancel()
+	v, err := s.Cache.GetOrLoad(c.Request.Context(), key, archiveLoadTimeout, func(ctx context.Context) (any, int64, time.Duration, error) {
 		ra := s.Stream.ReaderAtFor(ctx, t, *e.Size)
 		l, err := archive.List(format, ra, *e.Size, int64(st.ArchiveMaxMB)<<20)
 		if err != nil {
@@ -313,7 +331,7 @@ func (s *Server) archiveList(c *gin.Context) {
 		return l, int64(len(b)), t.Storage.CacheTTL(), nil
 	})
 	if err != nil {
-		fail(c, badRequest(err.Error()))
+		fail(c, archiveLoadError(err))
 		return
 	}
 	c.JSON(200, gin.H{"listing": v, "sequential": archive.Sequential(format), "budget_mb": st.ArchiveMaxMB})
