@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/dvfs/dropbox-vfs-manager/internal/dropbox"
 	"github.com/dvfs/dropbox-vfs-manager/internal/dropbox/fake"
 	"github.com/dvfs/dropbox-vfs-manager/internal/storage"
 )
@@ -287,5 +290,22 @@ func TestArchiveListMalformedArchiveIsBadRequest(t *testing.T) {
 	got := awaitReply(t, runArchiveList(s, context.Background(), "/m/a.zip"), "archiveList")
 	if got.status != http.StatusBadRequest {
 		t.Fatalf("status = %d body %q, want 400", got.status, got.body)
+	}
+}
+
+// A storage that is being restored fails the archive load the same way it fails every other read,
+// so the load error keeps that meaning instead of turning into a bad request.
+func TestArchiveLoadErrorKeepsStorageStatus(t *testing.T) {
+	err := fmt.Errorf("archive read: %w", storage.ErrRestoreInProgress)
+	if got := archiveLoadError(err); got != err {
+		t.Fatalf("archiveLoadError(%v) = %v, want the original error", err, got)
+	}
+	var provider *dropbox.APIError
+	if got := archiveLoadError(&dropbox.APIError{Status: 429, Summary: "too_many_requests/.."}); !errors.As(got, &provider) {
+		t.Fatalf("archiveLoadError dropped the provider error: %v", got)
+	}
+	var ae *apiError
+	if got := archiveLoadError(errors.New("ZIP 파일을 읽을 수 없습니다: not a valid zip file")); !errors.As(got, &ae) || ae.status != http.StatusBadRequest {
+		t.Fatalf("archiveLoadError(parse failure) = %v, want a 400", got)
 	}
 }

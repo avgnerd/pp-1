@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/dvfs/dropbox-vfs-manager/internal/media"
+	"github.com/dvfs/dropbox-vfs-manager/internal/pathutil"
 	"github.com/dvfs/dropbox-vfs-manager/internal/search"
 )
 
@@ -25,12 +26,26 @@ func (s *Server) search(c *gin.Context) {
 		fail(c, badRequest("검색어를 입력하세요"))
 		return
 	}
-	ctx := c.Request.Context()
+	scope := c.Query("scope")
+	if scope != "" {
+		cleaned, err := pathutil.Clean(scope)
+		if err != nil {
+			fail(c, err)
+			return
+		}
+		scope = cleaned
+	}
+	// A child context lets the handler stop the search when it returns, including on the
+	// write-failure path, where the request context is still live and a worker blocked on an
+	// event the handler will never take would hold its SearchLim slot for the life of the
+	// request's connection.
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
 	send := sse(c)
 	events := make(chan search.Event, 32)
 	errc := make(chan error, 1)
 	go func() {
-		errc <- search.Run(ctx, s.St, s.SearchLim, search.Options{Query: q, Kind: kind, Scope: c.Query("scope")}, func(e search.Event) {
+		errc <- search.Run(ctx, s.St, s.SearchLim, search.Options{Query: q, Kind: kind, Scope: scope}, func(e search.Event) {
 			select {
 			case events <- e:
 			case <-ctx.Done():
