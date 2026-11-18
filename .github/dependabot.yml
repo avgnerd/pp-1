@@ -18,6 +18,12 @@ updates:
     directory: "/frontend"
     schedule:
       interval: "weekly"
+    ignore:
+      # @types/node tracks the Node major this project builds on, and that major moves with CI and
+      # the Docker image, so it is bumped by hand rather than by a Dependabot major PR.
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
     groups:
       # Keep @videojs/core, react, and hlsjs-video on one version; they must move together.
       videojs:
