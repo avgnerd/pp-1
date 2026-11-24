@@ -265,6 +265,23 @@ function VirtualRows({ entries, selection, onOpenImage }: { entries: Entry[]; se
   )
 }
 
+/** A grid tile's thumbnail, falling back to the file icon when it cannot be loaded. */
+function GridThumb({ entry }: { entry: Entry }) {
+  const [failed, setFailed] = useState(false)
+  if (!thumbnailable(entry.name) || failed) return <EntryIcon entry={entry} className="size-10" />
+  return (
+    <img
+      src={urls.thumb(entry.path, entry.rev, "w256h256")}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      className="size-full object-cover"
+      onLoad={(ev) => rememberRatio(entry.path, ev.currentTarget)}
+      onError={() => setFailed(true)}
+    />
+  )
+}
+
 function Grid({ entries, selection, onOpenImage }: { entries: Entry[]; selection: Entry[]; onOpenImage: (e: Entry) => void }) {
   const selected = useSelection((s) => s.selected)
   const toggle = useSelection((s) => s.toggle)
@@ -283,18 +300,7 @@ function Grid({ entries, selection, onOpenImage }: { entries: Entry[]; selection
               aria-label={isImage ? `${e.name} 원본 보기` : `${e.name} 열기`}
               className="grid aspect-square place-items-center overflow-hidden rounded-md bg-muted/60 focus-visible:outline-2 focus-visible:outline-ring"
             >
-              {isImage && thumbnailable(e.name) ? (
-                <img
-                  src={urls.thumb(e.path, e.rev, "w256h256")}
-                  alt=""
-                  loading="lazy"
-                  decoding="async"
-                  className="size-full object-cover"
-                  onLoad={(ev) => rememberRatio(e.path, ev.currentTarget)}
-                />
-              ) : (
-                <EntryIcon entry={e} className="size-10" />
-              )}
+              {isImage ? <GridThumb entry={e} /> : <EntryIcon entry={e} className="size-10" />}
             </button>
             <div className="absolute top-2.5 left-2.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 data-checked:opacity-100" data-checked={checked || undefined}>
               <Checkbox checked={checked} onCheckedChange={() => toggle(e.path)} aria-label={`${e.name} 선택`} className="bg-background" />

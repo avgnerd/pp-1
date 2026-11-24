@@ -72,6 +72,7 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
       [
         entry("/synthetic/gallery/#1 <b>tag.jpg", "file"),
         entry("/synthetic/gallery/A <b>B & C.jpg", "file"),
+        entry("/synthetic/gallery/vector.svg", "file"),
       ],
     ],
     ["/synthetic/normal", [entry("/synthetic/normal/child")]],

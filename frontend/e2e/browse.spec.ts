@@ -629,6 +629,47 @@ test("a slow backup file read cannot describe the file chosen after it", async (
   await expect(passwordField).toHaveValue("")
 })
 
+test("a grid thumbnail that fails to load falls back to the file icon", async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      "dvfs-prefs",
+      JSON.stringify({ state: { view: "grid" }, version: 0 })
+    )
+  )
+  const thumbs: string[] = []
+  await page.route("**/api/fs/thumb?**", (route) => {
+    thumbs.push(new URL(route.request().url()).searchParams.get("path") ?? "")
+    return route.fulfill({ status: 404, body: "" })
+  })
+  await page.goto(server.origin + "/synthetic/gallery")
+  const tile = page.getByRole("button", {
+    name: "A <b>B & C.jpg 원본 보기",
+    exact: true,
+  })
+  await expect
+    .poll(() => thumbs.filter((path) => path.includes("B & C")).length)
+    .toBeGreaterThan(0)
+  await expect(tile.locator("svg")).toHaveCount(1)
+  await expect(tile.locator("img")).toHaveCount(0)
+})
+
+test("the gallery asks for a thumbnail only for files that have one", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic/gallery")
+  await page
+    .getByRole("button", { name: "vector.svg 원본 보기", exact: true })
+    .click()
+  await expect(page.locator(".lg-thumb-item")).toHaveCount(3)
+  const sources = await page
+    .locator(".lg-thumb-item img")
+    .evaluateAll((images) => images.map((image) => image.getAttribute("src")))
+  expect(sources.filter((src) => src?.includes("/api/fs/thumb"))).toHaveLength(2)
+  expect(sources.some((src) => src?.includes("vector.svg"))).toBe(true)
+})
+
 test("a storage without an account email still reports the connection", async ({
   page,
 }) => {
