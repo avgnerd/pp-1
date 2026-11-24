@@ -80,6 +80,13 @@ func New(st *storage.Manager, dir string, maxSize func() int64) (*Service, error
 		if e.IsDir() {
 			continue
 		}
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			// A process that died between the temporary write and the rename left this behind. It
+			// is not a thumbnail: indexing it would charge the size limit for a file that can
+			// never be served.
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+			continue
+		}
 		info, err := e.Info()
 		if err != nil {
 			continue
@@ -191,22 +198,38 @@ func (s *Service) run(storageID int64, size string, reqs []request) {
 	}
 }
 
+// store writes the thumbnail and updates the index. Callers can store the same key at once, because
+// Get batches a miss per storage and size rather than per path, so the temporary file must be unique
+// per writer and the rename must be ordered with the index update it belongs to.
 func (s *Service) store(name string, data []byte) {
-	tmp := filepath.Join(s.dir, name+".tmp")
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.CreateTemp(s.dir, name+".*.tmp")
+	if err != nil {
 		return
 	}
-	if err := os.Rename(tmp, filepath.Join(s.dir, name)); err != nil {
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return
+	}
+	if err := f.Close(); err != nil {
 		os.Remove(tmp)
 		return
 	}
 	s.diskMu.Lock()
-	if old, ok := s.files[name]; ok {
-		s.total -= old.size
+	err = os.Rename(tmp, filepath.Join(s.dir, name))
+	if err == nil {
+		if old, ok := s.files[name]; ok {
+			s.total -= old.size
+		}
+		s.files[name] = fileInfo{size: int64(len(data)), access: time.Now()}
+		s.total += int64(len(data))
 	}
-	s.files[name] = fileInfo{size: int64(len(data)), access: time.Now()}
-	s.total += int64(len(data))
 	s.diskMu.Unlock()
+	if err != nil {
+		os.Remove(tmp)
+		return
+	}
 	s.evict()
 }
 
