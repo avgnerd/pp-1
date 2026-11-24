@@ -438,18 +438,13 @@ func bindJSON(c *gin.Context, v any) error {
 	return nil
 }
 
-// baseURL returns public_url or the scheme+host the request came in on.
+// baseURL returns public_url or the scheme+host the request came in on. The scheme comes from
+// Config.Scheme, the same reading the session cookie uses: a forwarded protocol, including a
+// comma-separated chain value, counts only from a trusted proxy. A configured public_url decides
+// the cookie's Secure flag even when it differs from the transport, so it is not reused here.
 func (s *Server) baseURL(c *gin.Context) string {
 	if s.Cfg.PublicURL != "" {
 		return s.Cfg.PublicURL
 	}
-	scheme := "http"
-	if c.Request.TLS != nil {
-		scheme = "https"
-	} else if s.Cfg.TrustedProxy(c.Request.RemoteAddr) {
-		if p := c.GetHeader("X-Forwarded-Proto"); p == "https" {
-			scheme = "https"
-		}
-	}
-	return scheme + "://" + c.Request.Host
+	return s.Cfg.Scheme(c.Request) + "://" + c.Request.Host
 }
