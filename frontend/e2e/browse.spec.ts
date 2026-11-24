@@ -629,6 +629,60 @@ test("a slow backup file read cannot describe the file chosen after it", async (
   await expect(passwordField).toHaveValue("")
 })
 
+test("a storage without an account email still reports the connection", async ({
+  page,
+}) => {
+  const storage = {
+    id: 1,
+    name: "Synthetic 1",
+    mount_path: "/synthetic",
+    status: "pending",
+    account_email: "",
+    account_name: "",
+    root_path: "/",
+    app_key: "synthetic-key",
+    account_id: "dbid:synthetic",
+    cache_ttl_min: 30,
+    auth_mode: "localhost",
+    redirect_uri: "http://127.0.0.1/api/oauth/callback",
+    last_error: "",
+    created_at: 0,
+    updated_at: 0,
+    authorized_at: 1000,
+  }
+  let reads = 0
+  // Dropbox can report a name without an email, and the server accepts that (handlers_auth.go
+  // falls back to the name). The first poll is still pending, the second one is authorized.
+  await page.route("**/api/admin/storages/1", async (route) => {
+    if (route.request().method() !== "GET") return route.continue()
+    const active = ++reads > 1
+    await route.fulfill({
+      json: {
+        ...storage,
+        status: active ? "active" : "pending",
+        authorized_at: active ? 2000 : 1000,
+        account_name: active ? "No Email Account" : "",
+      },
+    })
+  })
+  await page.route("**/api/admin/storages/1/reauth", (route) =>
+    route.fulfill({
+      json: {
+        storage,
+        authorize_url: "https://www.dropbox.com/oauth2/authorize?client_id=x",
+        redirect_uri: storage.redirect_uri,
+      },
+    })
+  )
+  await page.goto(server.origin + "/admin/storages")
+  await page.getByRole("button", { name: "재인증", exact: true }).click()
+  await page.getByRole("button", { name: "승인 링크 만들기", exact: true }).click()
+  await expect(page.getByText("연결되었습니다", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  })
+  await expect(page.getByText(/No Email Account 계정이/)).toBeVisible()
+})
+
 test("move dialog treats two spellings of one folder as the same destination", async ({
   page,
 }) => {

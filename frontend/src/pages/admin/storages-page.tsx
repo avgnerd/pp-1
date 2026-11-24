@@ -428,7 +428,10 @@ function AuthStep({ start, onClose }: { start: AuthStart; onClose: () => void })
     queryFn: () => api.storage(id),
     refetchInterval: (q) => (q.state.data?.status === "active" && q.state.data.authorized_at > since ? false : 2000),
   })
-  const connected = !!status.data && status.data.status === "active" && !!status.data.account_email && status.data.authorized_at > since
+  // The server accepts a Dropbox account that reports a name but no email, so the email cannot
+  // gate the connected state or the dialog would wait forever on such an account.
+  const connected = !!status.data && status.data.status === "active" && status.data.authorized_at > since
+  const account = status.data?.account_email || status.data?.account_name || ""
   const [code, setCode] = useState("")
   const [url, setUrl] = useState("")
   const [busy, setBusy] = useState(false)
@@ -463,7 +466,7 @@ function AuthStep({ start, onClose }: { start: AuthStart; onClose: () => void })
             <CheckCircle2Icon />
             <AlertTitle>연결되었습니다</AlertTitle>
             <AlertDescription>
-              {status.data?.account_email} 계정이 {status.data?.mount_path}에 연결되었습니다.
+              {account ? `${account} 계정이` : "Dropbox 계정이"} {status.data?.mount_path}에 연결되었습니다.
             </AlertDescription>
           </Alert>
         ) : (
