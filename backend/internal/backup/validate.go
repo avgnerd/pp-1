@@ -91,16 +91,18 @@ func ValidatePayload(p *Payload) error {
 		default:
 			errs = append(errs, label+": status는 active, pending, error 중 하나여야 합니다")
 		}
-		if rec.Status != storage.StatusPending {
-			if strings.TrimSpace(rec.AppKey) == "" {
-				errs = append(errs, label+": app_key가 비어 있습니다")
-			}
-			if strings.TrimSpace(rec.AppSecret) == "" {
-				errs = append(errs, label+": app_secret이 비어 있습니다")
-			}
-			if strings.TrimSpace(rec.RefreshToken) == "" {
-				errs = append(errs, label+": refresh_token이 비어 있습니다")
-			}
+		// storage.Create stores an app key and an app secret for a pending storage too, and Update
+		// cannot replace either one, so a restored pending row without them can never be
+		// authorized. The refresh token is the one credential a pending storage does not have yet:
+		// its OAuth completion writes it.
+		if strings.TrimSpace(rec.AppKey) == "" {
+			errs = append(errs, label+": app_key가 비어 있습니다")
+		}
+		if strings.TrimSpace(rec.AppSecret) == "" {
+			errs = append(errs, label+": app_secret이 비어 있습니다")
+		}
+		if rec.Status != storage.StatusPending && strings.TrimSpace(rec.RefreshToken) == "" {
+			errs = append(errs, label+": refresh_token이 비어 있습니다")
 		}
 	}
 	// Two mount points may not be equal or nested: /a/b would be reachable through /a.

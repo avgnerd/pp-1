@@ -475,7 +475,9 @@ func validPayload(t *testing.T) *Payload {
 		},
 		Storages: []StorageRecord{
 			{ID: 1, Name: "Main", MountPath: "/main", Status: "active", AppKey: "k", AppSecret: "s", RefreshToken: "r"},
-			{ID: 2, Name: "Empty", MountPath: "/empty", Status: "pending", AppKey: "k"},
+			// A pending storage has both credentials (storage.Create stores them) and no token
+			// yet (the OAuth completion writes it).
+			{ID: 2, Name: "Empty", MountPath: "/empty", Status: "pending", AppKey: "k", AppSecret: "s"},
 		},
 	}
 }
