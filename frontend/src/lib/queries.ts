@@ -44,6 +44,8 @@ export function useSearchRevision() {
   return useQuery({ queryKey: keys.searchRevision, queryFn: () => 0, initialData: 0, enabled: false })
 }
 
+const running = new Map<string, () => void>()
+
 /**
  * After a rename/move/copy/delete: refetch the affected folder listings and forget
  * on-demand folder sizes of every ancestor and descendant of the changed paths.
@@ -55,6 +57,14 @@ export function afterChange(changed: string[]) {
   const related = (queryKey: readonly unknown[]) => {
     const p = queryKey[1]
     return typeof p === "string" && changed.some((c) => isRelatedPath(p, c))
+  }
+  // A running size stream keeps reporting progress and a final total for the state before the
+  // change. Its cached total is dropped below, so the stream has to stop first or it writes that
+  // old total back into the cache.
+  for (const [path, close] of running) {
+    if (!changed.some((c) => isRelatedPath(path, c))) continue
+    close()
+    running.delete(path)
   }
   queryClient.removeQueries({ queryKey: ["fsize"], predicate: (q) => related(q.queryKey) })
   for (const key of ["list", "stat", "siblings", "picker"] as const) {
@@ -69,8 +79,6 @@ export interface FolderSizeState {
   folders: number
   error?: string
 }
-
-const running = new Map<string, () => void>()
 
 /** On-demand folder size: nothing is computed until start() is called from the context menu. */
 export function useFolderSizeActions() {

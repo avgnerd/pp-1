@@ -506,6 +506,44 @@ test("out of range storage page canonicalizes to the last page", async ({
   await expect(page.getByText("2개", { exact: true })).toBeVisible()
 })
 
+test("a deleted file closes the folder size stream it invalidates", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic")
+  const folder = page.getByRole("link", { name: "normal", exact: true })
+  await folder.click({ button: "right" })
+  await page.getByRole("menuitem", { name: "폴더 크기", exact: true }).click()
+  const row = page.getByRole("row").filter({ hasText: "normal" })
+  await expect(row.getByText("1.00 KB", { exact: true })).toBeVisible()
+  expect(
+    server.sizeStreams.filter(
+      (s: { path: string; closed: boolean }) =>
+        s.path === "/synthetic/normal" && !s.closed
+    )
+  ).toHaveLength(1)
+
+  await folder.click()
+  await expect(link(page, "child")).toBeVisible()
+  await page.getByRole("checkbox", { name: "child 선택", exact: true }).check()
+  await page.getByRole("button", { name: "삭제", exact: true }).click()
+  await page
+    .getByRole("alertdialog")
+    .getByRole("button", { name: "삭제", exact: true })
+    .click()
+  await expect(link(page, "child")).toHaveCount(0)
+  await navigate(page, "synthetic")
+  // The total belongs to the state before the delete, so the stream must not deliver it.
+  await expect
+    .poll(() =>
+      server.sizeStreams.some(
+        (s: { path: string; closed: boolean }) => s.path === "/synthetic/normal" && s.closed
+      )
+    )
+    .toBe(true)
+  server.finishSize("/synthetic/normal", { bytes: 1024, files: 3, folders: 0 })
+  await expect(row.getByText("1.00 KB", { exact: true })).toHaveCount(0)
+})
+
 test("move dialog treats two spellings of one folder as the same destination", async ({
   page,
 }) => {
