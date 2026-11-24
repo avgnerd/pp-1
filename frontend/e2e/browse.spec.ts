@@ -506,6 +506,36 @@ test("out of range storage page canonicalizes to the last page", async ({
   await expect(page.getByText("2개", { exact: true })).toBeVisible()
 })
 
+test("saving an invalid value shows the error on the tab that holds it", async ({
+  page,
+}) => {
+  await stubAdminSettings(page)
+  let saves = 0
+  page.on("request", (request) => {
+    if (
+      request.method() === "PUT" &&
+      new URL(request.url()).pathname === "/api/admin/settings"
+    )
+      saves++
+  })
+  await page.goto(server.origin + "/admin/settings")
+  await expect(page.getByRole("heading", { name: "설정", exact: true })).toBeVisible()
+  await page.getByRole("tab", { name: "시스템", exact: true }).click()
+  await page.getByLabel("동시 변환 수", { exact: true }).fill("32")
+  await page.getByRole("tab", { name: "사이트", exact: true }).click()
+  await page.getByRole("button", { name: "설정 저장", exact: true }).click()
+  await expect(
+    page.getByText("동시 변환 수은(는) 16 이하여야 합니다", { exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByRole("tab", { name: "시스템", exact: true })
+  ).toHaveAttribute("aria-selected", "true")
+  await expect(
+    page.getByLabel("동시 변환 수", { exact: true })
+  ).toHaveValue("32")
+  expect(saves).toBe(0)
+})
+
 test("a deleted file closes the folder size stream it invalidates", async ({
   page,
 }) => {
