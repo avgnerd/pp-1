@@ -174,7 +174,6 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
   const endHlsPlayback = useCallback(() => {
     const el = videoRef.current ?? audioRef.current
     if (!el) return
-    hlsRetries.current = 0
     resumePlay.current = false
     restoringFrom.current = null
     el.pause()
