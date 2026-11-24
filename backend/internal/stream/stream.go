@@ -37,15 +37,6 @@ type Streamer struct {
 	Cache *cache.Cache
 	Box   *secret.Box
 	HTTP  *http.Client
-
-	linkMu    sync.Mutex
-	linkLoads map[string]*tempLinkCall
-}
-
-type tempLinkCall struct {
-	done chan struct{}
-	link string
-	err  error
 }
 
 // New creates a streamer.
@@ -76,63 +67,26 @@ func (s *Streamer) TempLink(ctx context.Context, t vfs.Target) (string, error) {
 	return link, nil
 }
 
+// sharedTempLink returns a cached temporary link or loads one on the shared load path. That path
+// owns the policy: one load per key with a detached context bounded by tempLinkLoadTimeout, and a
+// result a removal overtook is returned to the callers already waiting on it but not cached, so a
+// link minted for the state a rename, a refresh or a restore replaced cannot come back.
 func (s *Streamer) sharedTempLink(ctx context.Context, key string, load func(context.Context) (string, error)) (string, error) {
-	if v, ok := s.Cache.Get(key); ok {
-		if link, ok := v.(string); ok {
-			return link, nil
+	v, err := s.Cache.GetOrLoad(ctx, key, tempLinkLoadTimeout, func(ctx context.Context) (any, int64, time.Duration, error) {
+		link, err := load(ctx)
+		if err != nil {
+			return nil, 0, 0, err
 		}
-	}
-
-	s.linkMu.Lock()
-	if v, ok := s.Cache.Get(key); ok {
-		if link, ok := v.(string); ok {
-			s.linkMu.Unlock()
-			return link, nil
-		}
-	}
-	if call := s.linkLoads[key]; call != nil {
-		s.linkMu.Unlock()
-		return waitTempLink(ctx, call)
-	}
-	if err := ctx.Err(); err != nil {
-		s.linkMu.Unlock()
+		return link, int64(len(link)), TempLinkTTL, nil
+	})
+	if err != nil {
 		return "", err
 	}
-	call := &tempLinkCall{done: make(chan struct{})}
-	if s.linkLoads == nil {
-		s.linkLoads = make(map[string]*tempLinkCall)
+	link, ok := v.(string)
+	if !ok {
+		return "", errors.New("stream: temporary link cache entry is not a string")
 	}
-	s.linkLoads[key] = call
-	s.linkMu.Unlock()
-
-	go s.loadTempLink(key, call, load)
-	return waitTempLink(ctx, call)
-}
-
-func (s *Streamer) loadTempLink(key string, call *tempLinkCall, load func(context.Context) (string, error)) {
-	ctx, cancel := context.WithTimeout(context.Background(), tempLinkLoadTimeout)
-	defer cancel()
-	link, err := load(ctx)
-	if err == nil {
-		s.Cache.Set(key, link, int64(len(link)), TempLinkTTL)
-	}
-
-	s.linkMu.Lock()
-	call.link, call.err = link, err
-	if s.linkLoads[key] == call {
-		delete(s.linkLoads, key)
-	}
-	close(call.done)
-	s.linkMu.Unlock()
-}
-
-func waitTempLink(ctx context.Context, call *tempLinkCall) (string, error) {
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-call.done:
-		return call.link, call.err
-	}
+	return link, nil
 }
 
 // ContentType guesses a MIME type from the file name, with fixes for common media types
@@ -181,6 +135,27 @@ func ContentType(name string) string {
 		return t
 	}
 	return "application/octet-stream"
+}
+
+// sandboxInline reports whether an inline response needs CSP sandbox. /api/fs/raw answers from the
+// app's own origin, so a type the browser renders as a document can run its script with the
+// session cookie and the CSRF header value. The allowed list is the set the previews embed in an
+// element that cannot run the file's script: raster images in <img>, audio and video in their
+// media elements, and the PDF viewer, whose document never gets the app's origin. Every other type
+// is sandboxed, which also covers the document types nobody listed: XML, XHTML and MHTML
+// (message/rfc822) all go inline otherwise.
+func sandboxInline(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return true
+	}
+	if mediaType == "application/pdf" {
+		return false
+	}
+	if strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml" {
+		return false
+	}
+	return !strings.HasPrefix(mediaType, "video/") && !strings.HasPrefix(mediaType, "audio/")
 }
 
 // ContentDisposition builds an RFC 6266 header with an ASCII fallback and UTF-8 filename*.
@@ -292,7 +267,7 @@ func (s *Streamer) Proxy(w http.ResponseWriter, r *http.Request, t vfs.Target, n
 			h.Set("Cache-Control", "private, max-age=3600")
 		}
 		h.Set("X-Content-Type-Options", "nosniff")
-		if strings.HasPrefix(ContentType(name), "text/html") || strings.HasPrefix(ContentType(name), "image/svg") {
+		if sandboxInline(contentType) {
 			h.Set("Content-Security-Policy", "sandbox")
 		}
 		w.WriteHeader(resp.StatusCode)

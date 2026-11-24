@@ -293,6 +293,124 @@ func TestConcurrent(t *testing.T) {
 	}
 }
 
+// A removal says the data behind the key changed. A load that was already running read the old
+// data, so it may answer the callers waiting on it but must not put that value back for the rest of
+// its TTL.
+func TestGetOrLoadDoesNotPublishAcrossRemoval(t *testing.T) {
+	cases := []struct {
+		name   string
+		remove func(*Cache)
+	}{
+		{"Delete", func(c *Cache) { c.Delete("dir:/x") }},
+		{"DeletePrefix", func(c *Cache) { c.DeletePrefix("dir:") }},
+		{"InvalidateAll", func(c *Cache) { c.InvalidateAll("") }},
+		{"DeleteFunc", func(c *Cache) { c.DeleteFunc(func(key string) bool { return key == "dir:/x" }) }},
+		{"Clear", func(c *Cache) { c.Clear() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(1000, 1<<20, time.Hour)
+			defer c.Stop()
+
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var calls atomic.Int32
+			load := func(context.Context) (any, int64, time.Duration, error) {
+				if calls.Add(1) > 1 {
+					return "fresh", 5, time.Hour, nil
+				}
+				close(started)
+				<-release
+				return "stale", 5, time.Hour, nil
+			}
+
+			type outcome struct {
+				val any
+				err error
+			}
+			first := make(chan outcome, 1)
+			go func() {
+				v, err := c.GetOrLoad(context.Background(), "dir:/x", time.Minute, load)
+				first <- outcome{val: v, err: err}
+			}()
+			<-started
+
+			tc.remove(c)
+			close(release)
+
+			select {
+			case got := <-first:
+				if got.err != nil {
+					t.Fatalf("the caller that started the load failed: %v", got.err)
+				}
+				if got.val.(string) != "stale" {
+					t.Fatalf("the caller got %v, want the value its load read", got.val)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the load did not finish")
+			}
+			if v, ok := c.Get("dir:/x"); ok {
+				t.Fatalf("the removal was undone: cached %v", v)
+			}
+			v, err := c.GetOrLoad(context.Background(), "dir:/x", time.Minute, load)
+			if err != nil {
+				t.Fatalf("later load: %v", err)
+			}
+			if v.(string) != "fresh" || calls.Load() != 2 {
+				t.Fatalf("later caller got %v after %d loads, want a fresh load", v, calls.Load())
+			}
+		})
+	}
+}
+
+// A caller that arrives after a removal must start its own load. Joining the load in flight when
+// the removal ran would hand it the pre-removal value.
+func TestGetOrLoadStartsFreshLoadAfterRemoval(t *testing.T) {
+	c := New(1000, 1<<20, time.Hour)
+	defer c.Stop()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	load := func(context.Context) (any, int64, time.Duration, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			return "stale", 5, time.Hour, nil
+		}
+		return "fresh", 5, time.Hour, nil
+	}
+
+	firstDone := make(chan any, 1)
+	go func() {
+		v, _ := c.GetOrLoad(context.Background(), "dir:/x", time.Minute, load)
+		firstDone <- v
+	}()
+	<-started
+	c.Delete("dir:/x")
+
+	second := make(chan any, 1)
+	go func() {
+		v, _ := c.GetOrLoad(context.Background(), "dir:/x", time.Minute, load)
+		second <- v
+	}()
+	select {
+	case got := <-second:
+		if got != "fresh" {
+			t.Fatalf("caller after the removal got %v, want its own load", got)
+		}
+		if calls.Load() != 2 {
+			t.Fatalf("loader called %d times, want a new load after the removal", calls.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a caller that arrived after the removal joined the load that started before it")
+	}
+	close(release)
+	if got := <-firstDone; got != "stale" {
+		t.Fatalf("first caller got %v, want the value its load read", got)
+	}
+}
+
 func TestStopIdempotent(t *testing.T) {
 	c := New(10, 1000, time.Hour)
 	c.Stop()

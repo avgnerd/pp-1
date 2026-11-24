@@ -51,6 +51,15 @@ type Cache struct {
 	stop     chan struct{}
 	done     chan struct{}
 	stopOnce sync.Once
+
+	// invalidationMu orders an explicit removal against the publish step of a background load. A
+	// load captures the counter before it starts and publishes only while the counter is unchanged,
+	// so a value a removal made stale is never written back for the rest of its TTL. The same
+	// boundary forgets the in-flight load of every key a removal takes out, so a caller that arrives
+	// after the removal starts a new load instead of joining one that predates it.
+	invalidationMu sync.Mutex
+	invalidation   uint64
+	loading        map[string]uint64 // generation captured by the load in flight for a key
 }
 
 // Stats is a point-in-time snapshot.
@@ -77,6 +86,7 @@ func New(maxEntries int, maxBytes int64, cleanup time.Duration) *Cache {
 		interval:   make(chan time.Duration, 1),
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
+		loading:    map[string]uint64{},
 	}
 	for i := range c.shards {
 		c.shards[i] = &shard{items: map[string]*list.Element{}, lru: list.New()}
@@ -145,6 +155,12 @@ func (c *Cache) Set(key string, val any, size int64, ttl time.Duration) {
 
 // Delete removes a key.
 func (c *Cache) Delete(key string) {
+	c.invalidationMu.Lock()
+	defer c.invalidationMu.Unlock()
+	c.invalidation++
+	if _, loading := c.loading[key]; loading {
+		c.sf.Forget(key)
+	}
 	s := c.shard(key)
 	s.mu.Lock()
 	if el, ok := s.items[key]; ok {
@@ -155,18 +171,7 @@ func (c *Cache) Delete(key string) {
 
 // DeletePrefix removes every key starting with prefix and returns the count removed.
 func (c *Cache) DeletePrefix(prefix string) int {
-	n := 0
-	for _, s := range c.shards {
-		s.mu.Lock()
-		for k, el := range s.items {
-			if strings.HasPrefix(k, prefix) {
-				s.removeElement(el)
-				n++
-			}
-		}
-		s.mu.Unlock()
-	}
-	return n
+	return c.removeMatching(func(key string) bool { return strings.HasPrefix(key, prefix) })
 }
 
 // InvalidateAll drops every cached entry whose key starts with prefix, or every entry when
@@ -178,11 +183,26 @@ func (c *Cache) InvalidateAll(prefix string) int {
 
 // DeleteFunc removes every key for which fn returns true.
 func (c *Cache) DeleteFunc(fn func(key string) bool) int {
+	return c.removeMatching(fn)
+}
+
+// removeMatching removes every entry match accepts and returns the count removed. It advances the
+// invalidation counter and forgets the in-flight load of every matching key, so a load that started
+// before the removal cannot publish after it and a later caller does not join that load.
+func (c *Cache) removeMatching(match func(string) bool) int {
+	c.invalidationMu.Lock()
+	defer c.invalidationMu.Unlock()
+	c.invalidation++
+	for key := range c.loading {
+		if match(key) {
+			c.sf.Forget(key)
+		}
+	}
 	n := 0
 	for _, s := range c.shards {
 		s.mu.Lock()
 		for k, el := range s.items {
-			if fn(k) {
+			if match(k) {
 				s.removeElement(el)
 				n++
 			}
@@ -194,6 +214,12 @@ func (c *Cache) DeleteFunc(fn func(key string) bool) int {
 
 // Clear removes everything.
 func (c *Cache) Clear() {
+	c.invalidationMu.Lock()
+	defer c.invalidationMu.Unlock()
+	c.invalidation++
+	for key := range c.loading {
+		c.sf.Forget(key)
+	}
 	for _, s := range c.shards {
 		s.mu.Lock()
 		s.items = map[string]*list.Element{}
@@ -209,6 +235,10 @@ func (c *Cache) Clear() {
 // The load runs on its own context bounded by timeout, so it outlives the caller that started
 // it: one caller going away neither fails the load for the callers waiting on the same key nor
 // keeps that caller blocked until the load ends. load must use the context it is given.
+//
+// A load that an explicit removal overtakes still returns its value to the callers waiting on it,
+// but it does not cache it: the removal happened because the data changed, and caching the value
+// read before it would serve stale data for the rest of the TTL.
 func (c *Cache) GetOrLoad(ctx context.Context, key string, timeout time.Duration, load func(context.Context) (any, int64, time.Duration, error)) (any, error) {
 	if v, ok := c.Get(key); ok {
 		return v, nil
@@ -222,13 +252,24 @@ func (c *Cache) GetOrLoad(ctx context.Context, key string, timeout time.Duration
 		if v, ok := c.Get(key); ok {
 			return v, nil
 		}
+		c.invalidationMu.Lock()
+		generation := c.invalidation
+		c.loading[key] = generation
+		c.invalidationMu.Unlock()
+		defer func() {
+			c.invalidationMu.Lock()
+			if c.loading[key] == generation {
+				delete(c.loading, key)
+			}
+			c.invalidationMu.Unlock()
+		}()
 		lctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		val, size, ttl, err := load(lctx)
 		if err != nil {
 			return nil, err
 		}
-		c.Set(key, val, size, ttl)
+		c.publishIfCurrent(generation, key, val, size, ttl)
 		return val, nil
 	})
 	select {
@@ -237,6 +278,18 @@ func (c *Cache) GetOrLoad(ctx context.Context, key string, timeout time.Duration
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// publishIfCurrent caches val only while no explicit removal has run since generation was captured.
+// The comparison and the write hold the same boundary the removals take, so a removal either runs
+// after the write and takes the entry out, or runs before it and the load stays uncached.
+func (c *Cache) publishIfCurrent(generation uint64, key string, val any, size int64, ttl time.Duration) {
+	c.invalidationMu.Lock()
+	defer c.invalidationMu.Unlock()
+	if c.invalidation != generation {
+		return
+	}
+	c.Set(key, val, size, ttl)
 }
 
 // Stats returns counters and current usage.

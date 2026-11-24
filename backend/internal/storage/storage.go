@@ -331,7 +331,7 @@ func (m *Manager) Client(id int64) (*dropbox.Client, error) {
 	if m.clientBuiltHook != nil {
 		m.clientBuiltHook()
 	}
-	return m.cacheClient(id, c), nil
+	return m.cacheClient(id, c)
 }
 
 // clientOwned builds and caches a client for a caller that already holds the mutation gate. The
@@ -342,7 +342,7 @@ func (m *Manager) clientOwned(id int64) (*dropbox.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return m.cacheClient(id, c), nil
+	return m.cacheClient(id, c)
 }
 
 // buildClient returns a cached client or builds one without publishing it. The caller must hold
@@ -356,11 +356,13 @@ func (m *Manager) buildClient(id int64) (*dropbox.Client, error) {
 	s := m.byID[id]
 	generation := m.clientGeneration
 	m.mu.RUnlock()
+	// The row is checked before the cache: a client cached for a row that is already gone answers
+	// for a storage that no longer exists, and Delete does not wait for a build it overlaps.
+	if s == nil {
+		return nil, ErrNotFound
+	}
 	if ok {
 		return c, nil
-	}
-	if s == nil {
-		return nil, errors.New("저장소를 찾을 수 없습니다")
 	}
 	if s.Status == StatusPending {
 		return nil, errors.New("이 저장소는 아직 Dropbox 인증을 마치지 않았습니다")
@@ -385,15 +387,20 @@ func (m *Manager) buildClient(id int64) (*dropbox.Client, error) {
 	return c, nil
 }
 
-// cacheClient publishes a built client and returns the one that won a concurrent insert.
-func (m *Manager) cacheClient(id int64, c *dropbox.Client) *dropbox.Client {
+// cacheClient publishes a built client and returns the one that won a concurrent insert. A build
+// that overlaps a Delete publishes nothing and reports the missing row: the client would answer for
+// a storage that the Delete's own cache eviction and reload already took out.
+func (m *Manager) cacheClient(id int64, c *dropbox.Client) (*dropbox.Client, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if existing, ok := m.clients[id]; ok {
-		return existing
+		return existing, nil
+	}
+	if _, ok := m.byID[id]; !ok {
+		return nil, ErrNotFound
 	}
 	m.clients[id] = c
-	return c
+	return c, nil
 }
 
 // markErrorIfCurrent records a reauth failure only while c is still the published client of the
@@ -569,7 +576,7 @@ func (m *Manager) Reauth(id int64, mode string) (*AuthStart, error) {
 	}
 	defer release()
 	if _, ok := m.Get(id); !ok {
-		return nil, errors.New("저장소를 찾을 수 없습니다")
+		return nil, ErrNotFound
 	}
 	if mode == "" {
 		mode = AuthLocalhost
@@ -578,8 +585,20 @@ func (m *Manager) Reauth(id int64, mode string) (*AuthStart, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := m.db.Exec(`UPDATE storages SET auth_mode = ?, redirect_uri = ?, updated_at = ? WHERE id = ?`, mode, redirect, m.now().Unix(), id); err != nil {
+	res, err := m.db.Exec(`UPDATE storages SET auth_mode = ?, redirect_uri = ?, updated_at = ? WHERE id = ?`, mode, redirect, m.now().Unix(), id)
+	if err != nil {
 		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		// The row was deleted between the snapshot read above and this write. Starting an
+		// authorization for it would fail later at the oauth_states insert or hand out a URL for
+		// a storage that no longer exists.
+		_ = m.reload()
+		return nil, ErrNotFound
 	}
 	if err := m.reload(); err != nil {
 		return nil, err
@@ -605,6 +624,12 @@ func (m *Manager) startAuth(id int64, mode, redirect string) (*AuthStart, error)
 
 // ErrState is returned for unknown, expired or reused OAuth states.
 var ErrState = errors.New("인증 요청이 만료되었거나 이미 사용되었습니다. 저장소 화면에서 다시 인증을 시작하세요")
+
+// ErrNotFound is returned when a storage row does not exist. A mutation can see it even after its
+// own snapshot read: Delete's row write does not wait for a mutation that holds the read side of
+// the gate, so the row can be gone between the read and the UPDATE. Reporting it is what keeps a
+// mutation from answering with a zero Storage, and the HTTP layer maps it to 404.
+var ErrNotFound = errors.New("저장소를 찾을 수 없습니다")
 
 // ErrRestoreInProgress is returned when a storage mutation arrives while a backup restore is
 // replacing the storage table and rebuilding the runtime.
@@ -724,7 +749,7 @@ func (m *Manager) beginAuthAttempt(id int64) (Storage, []byte, authAttempt, erro
 	defer m.stateMu.Unlock()
 	s, ok := m.Get(id)
 	if !ok {
-		return Storage{}, nil, authAttempt{}, errors.New("저장소를 찾을 수 없습니다")
+		return Storage{}, nil, authAttempt{}, ErrNotFound
 	}
 	var appSecretEnc, tokenEnc []byte
 	if err := m.db.QueryRow(`SELECT app_secret_enc, refresh_token_enc FROM storages WHERE id = ?`, id).
@@ -852,7 +877,7 @@ func (m *Manager) Update(id int64, in Input) (Storage, error) {
 	}
 	defer release()
 	if _, ok := m.Get(id); !ok {
-		return Storage{}, errors.New("저장소를 찾을 수 없습니다")
+		return Storage{}, ErrNotFound
 	}
 	m.mountMu.Lock()
 	defer m.mountMu.Unlock()
@@ -867,9 +892,21 @@ func (m *Manager) Update(id int64, in Input) (Storage, error) {
 	if err := ValidateCacheTTLMin(in.CacheTTLMin); err != nil {
 		return Storage{}, err
 	}
-	if _, err := m.db.Exec(`UPDATE storages SET name = ?, mount_path = ?, root_path = ?, cache_ttl_min = ?, updated_at = ? WHERE id = ?`,
-		strings.TrimSpace(in.Name), mount, root, in.CacheTTLMin, m.now().Unix(), id); err != nil {
+	res, err := m.db.Exec(`UPDATE storages SET name = ?, mount_path = ?, root_path = ?, cache_ttl_min = ?, updated_at = ? WHERE id = ?`,
+		strings.TrimSpace(in.Name), mount, root, in.CacheTTLMin, m.now().Unix(), id)
+	if err != nil {
 		return Storage{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return Storage{}, err
+	}
+	if n == 0 {
+		// A concurrent Delete wrote the row away after the snapshot read above. Leave the
+		// snapshot on the database state and report the missing row: an empty Storage with no
+		// error would reach the admin page as a 200 for a storage that does not exist.
+		_ = m.reload()
+		return Storage{}, ErrNotFound
 	}
 	if err := m.reload(); err != nil {
 		return Storage{}, err
@@ -888,10 +925,16 @@ func (m *Manager) Delete(ctx context.Context, id int64) error {
 	defer release()
 	s, ok := m.Get(id)
 	if !ok {
-		return errors.New("저장소를 찾을 수 없습니다")
+		return ErrNotFound
 	}
 	if s.Status != StatusPending {
-		if c, err := m.clientOwned(id); err == nil {
+		// The revoke client is built and published under the same state boundary a reauth
+		// completion takes, or a client built from the token that completion replaced could be
+		// published after it. The revoke itself is a network call and runs outside every lock.
+		m.stateMu.Lock()
+		c, err := m.clientOwned(id)
+		m.stateMu.Unlock()
+		if err == nil {
 			rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			_ = c.Revoke(rctx)
 			cancel()

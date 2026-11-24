@@ -115,6 +115,52 @@ func TestSharedTempLinkIsolatedFromCallerCancel(t *testing.T) {
 	}
 }
 
+// A temporary link minted before a removal belongs to the state the removal replaced: a 410
+// refresh, a rename, or a restore. The callers waiting on that load get the link, but it must not
+// be cached again afterwards, or the replaced state is served for the rest of the link's TTL.
+func TestTempLinkNotCachedAfterInvalidation(t *testing.T) {
+	c := cache.New(1000, 1<<20, time.Hour)
+	defer c.Stop()
+	s := &Streamer{Cache: c}
+	key := vfs.TempLinkKey(7, "/movie.mp4")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	load := func(context.Context) (string, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			return "stale-link", nil
+		}
+		return "fresh-link", nil
+	}
+
+	firstDone := make(chan string, 1)
+	go func() {
+		link, _ := s.sharedTempLink(context.Background(), key, load)
+		firstDone <- link
+	}()
+	<-started
+	c.Delete(key)
+	close(release)
+	select {
+	case got := <-firstDone:
+		if got != "stale-link" {
+			t.Fatalf("caller got link %q, want the link its load read", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the temporary link load did not finish")
+	}
+	if v, ok := c.Get(key); ok {
+		t.Fatalf("the invalidated temporary link was cached again: %v", v)
+	}
+	link, err := s.sharedTempLink(context.Background(), key, load)
+	if err != nil || link != "fresh-link" {
+		t.Fatalf("after invalidation got link %q err %v, want a freshly loaded link", link, err)
+	}
+}
+
 type streamRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f streamRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -301,6 +347,51 @@ func TestProxyRangeContentTypePolicy(t *testing.T) {
 			t.Fatalf("Content-Security-Policy=%q, want sandbox", got)
 		}
 	})
+}
+
+// TestProxySandboxCoversEveryInlineDocument covers the response the browser renders as a document
+// from the app's own origin: a file the browser treats as a document can run script with the
+// session cookie and the CSRF header value. Only the media types the previews embed in an element
+// that cannot run the file's script may go inline without CSP sandbox.
+func TestProxySandboxCoversEveryInlineDocument(t *testing.T) {
+	s, _, target := proxyFixture(t, streamRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return proxyResponse(req, http.StatusOK, http.Header{}, "x"), nil
+	}))
+	cases := []struct {
+		name string
+		want string
+	}{
+		{"evil.html", "sandbox"},
+		{"evil.htm", "sandbox"},
+		{"evil.svg", "sandbox"},
+		{"evil.xml", "sandbox"},
+		{"evil.xsl", "sandbox"},
+		{"evil.xhtml", "sandbox"},
+		{"evil.xht", "sandbox"},
+		{"evil.mhtml", "sandbox"},
+		{"evil.json", "sandbox"},
+		{"evil.txt", "sandbox"},
+		{"no-extension", "sandbox"},
+		{"movie.mp4", ""},
+		{"movie.mkv", ""},
+		{"song.flac", ""},
+		{"photo.jpg", ""},
+		{"anim.webp", ""},
+		{"doc.pdf", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "http://app.test/api/fs/raw", nil)
+			if err := s.Proxy(rec, req, target, tc.name, false); err != nil {
+				t.Fatal(err)
+			}
+			if got := rec.Header().Get("Content-Security-Policy"); got != tc.want {
+				t.Fatalf("%s served as %q: Content-Security-Policy=%q, want %q",
+					tc.name, rec.Header().Get("Content-Type"), got, tc.want)
+			}
+		})
+	}
 }
 
 func TestProxyRetries429AndDrainsIntermediateBody(t *testing.T) {
