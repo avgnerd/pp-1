@@ -303,6 +303,51 @@ func TestProxyRangeContentTypePolicy(t *testing.T) {
 	})
 }
 
+// TestProxySandboxCoversEveryInlineDocument covers the response the browser renders as a document
+// from the app's own origin: a file the browser treats as a document can run script with the
+// session cookie and the CSRF header value. Only the media types the previews embed in an element
+// that cannot run the file's script may go inline without CSP sandbox.
+func TestProxySandboxCoversEveryInlineDocument(t *testing.T) {
+	s, _, target := proxyFixture(t, streamRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return proxyResponse(req, http.StatusOK, http.Header{}, "x"), nil
+	}))
+	cases := []struct {
+		name string
+		want string
+	}{
+		{"evil.html", "sandbox"},
+		{"evil.htm", "sandbox"},
+		{"evil.svg", "sandbox"},
+		{"evil.xml", "sandbox"},
+		{"evil.xsl", "sandbox"},
+		{"evil.xhtml", "sandbox"},
+		{"evil.xht", "sandbox"},
+		{"evil.mhtml", "sandbox"},
+		{"evil.json", "sandbox"},
+		{"evil.txt", "sandbox"},
+		{"no-extension", "sandbox"},
+		{"movie.mp4", ""},
+		{"movie.mkv", ""},
+		{"song.flac", ""},
+		{"photo.jpg", ""},
+		{"anim.webp", ""},
+		{"doc.pdf", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "http://app.test/api/fs/raw", nil)
+			if err := s.Proxy(rec, req, target, tc.name, false); err != nil {
+				t.Fatal(err)
+			}
+			if got := rec.Header().Get("Content-Security-Policy"); got != tc.want {
+				t.Fatalf("%s served as %q: Content-Security-Policy=%q, want %q",
+					tc.name, rec.Header().Get("Content-Type"), got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProxyRetries429AndDrainsIntermediateBody(t *testing.T) {
 	rateBody := &observedBody{Reader: strings.NewReader("rate limited")}
 	var attempts atomic.Int32

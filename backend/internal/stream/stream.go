@@ -76,6 +76,7 @@ func (s *Streamer) TempLink(ctx context.Context, t vfs.Target) (string, error) {
 	return link, nil
 }
 
+// sharedTempLink returns a cached temporary link or loads one on the shared load path.
 func (s *Streamer) sharedTempLink(ctx context.Context, key string, load func(context.Context) (string, error)) (string, error) {
 	if v, ok := s.Cache.Get(key); ok {
 		if link, ok := v.(string); ok {
@@ -181,6 +182,27 @@ func ContentType(name string) string {
 		return t
 	}
 	return "application/octet-stream"
+}
+
+// sandboxInline reports whether an inline response needs CSP sandbox. /api/fs/raw answers from the
+// app's own origin, so a type the browser renders as a document can run its script with the
+// session cookie and the CSRF header value. The allowed list is the set the previews embed in an
+// element that cannot run the file's script: raster images in <img>, audio and video in their
+// media elements, and the PDF viewer, whose document never gets the app's origin. Every other type
+// is sandboxed, which also covers the document types nobody listed: XML, XHTML and MHTML
+// (message/rfc822) all go inline otherwise.
+func sandboxInline(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return true
+	}
+	if mediaType == "application/pdf" {
+		return false
+	}
+	if strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml" {
+		return false
+	}
+	return !strings.HasPrefix(mediaType, "video/") && !strings.HasPrefix(mediaType, "audio/")
 }
 
 // ContentDisposition builds an RFC 6266 header with an ASCII fallback and UTF-8 filename*.
@@ -292,7 +314,7 @@ func (s *Streamer) Proxy(w http.ResponseWriter, r *http.Request, t vfs.Target, n
 			h.Set("Cache-Control", "private, max-age=3600")
 		}
 		h.Set("X-Content-Type-Options", "nosniff")
-		if strings.HasPrefix(ContentType(name), "text/html") || strings.HasPrefix(ContentType(name), "image/svg") {
+		if sandboxInline(contentType) {
 			h.Set("Content-Security-Policy", "sandbox")
 		}
 		w.WriteHeader(resp.StatusCode)
