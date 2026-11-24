@@ -959,7 +959,11 @@ func (s *Session) start(n int) error {
 		cancel()
 		return err
 	}
-	runAt := time.Now()
+	runAt, err := s.runBoundary()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("변환 시작 시각을 읽지 못했습니다: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return fmt.Errorf("ffmpeg 실행 실패: %w", err)
@@ -1029,6 +1033,27 @@ func (s *Session) start(n int) error {
 func fileExists(p string) bool {
 	st, err := os.Stat(p)
 	return err == nil && st.Size() > 0
+}
+
+// runBoundaryName is the probe a run is timestamped with.
+const runBoundaryName = ".run-start"
+
+// runBoundary returns the session filesystem's clock reading for a run that is about to start, so
+// the boundary a run's output is compared against comes from the same clock that stamps the output.
+// A comparison against the wall clock rejects a file the run just wrote whenever the filesystem
+// records timestamps in coarser ticks (1-4 ms on Linux, what the deployment's overlayfs uses):
+// the run's own init.mp4 then looks older than the run, and Init waits for a first segment that is
+// already on disk.
+func (s *Session) runBoundary() (time.Time, error) {
+	p := filepath.Join(s.dir, runBoundaryName)
+	if err := os.WriteFile(p, []byte("run"), 0o600); err != nil {
+		return time.Time{}, err
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return st.ModTime(), nil
 }
 
 func fileExistsAfter(p string, since time.Time) bool {
