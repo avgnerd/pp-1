@@ -118,6 +118,8 @@ export default function BackupPage() {
   // Section B: Restore from File state
   const fileInputRef = useRef<HTMLInputElement>(null)
   const restorePasswordRef = useRef<HTMLInputElement>(null)
+  // Which file selection the asynchronous read belongs to.
+  const selectionRef = useRef(0)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [fileSizeError, setFileSizeError] = useState<string | null>(null)
   const [inspectedMode, setInspectedMode] = useState<"password" | "none" | "instance-key" | null>(null)
@@ -212,8 +214,11 @@ export default function BackupPage() {
   }
 
   const handleFileChange = async (file: File | null) => {
+    const selection = ++selectionRef.current
     setRestoreError(null)
     setInspectedMode(null)
+    // A password typed for the previous file says nothing about the file picked now.
+    setRestorePassword("")
 
     if (!file) {
       setSelectedFile(null)
@@ -231,6 +236,8 @@ export default function BackupPage() {
 
     try {
       const text = await file.text()
+      // Reading is asynchronous, so a file picked while it ran has replaced this one already.
+      if (selection !== selectionRef.current) return
       const parsed = JSON.parse(text) as {
         encrypted?: unknown
         encryption_mode?: unknown
@@ -240,7 +247,9 @@ export default function BackupPage() {
           const mode = parsed.encryption_mode === "instance-key" ? "instance-key" : "password"
           setInspectedMode(mode)
           if (mode === "password") {
-            setTimeout(() => restorePasswordRef.current?.focus(), 0)
+            setTimeout(() => {
+              if (selection === selectionRef.current) restorePasswordRef.current?.focus()
+            }, 0)
           }
         } else if (parsed.encrypted === false) {
           setInspectedMode("none")

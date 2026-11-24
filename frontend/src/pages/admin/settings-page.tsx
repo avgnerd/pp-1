@@ -38,28 +38,46 @@ const schema = z.object({
   archive_max_mb: int(1, 100000, "압축 파일 읽기 상한"),
 })
 
+/** Which tab holds each field: a validation error in another tab has to bring that tab forward. */
+const TAB_FIELDS: [string, (keyof Settings)[]][] = [
+  ["site", ["robots_txt", "pagination_type", "per_page"]],
+  ["preview", ["audio_autoplay", "video_autoplay", "archive_preview"]],
+  ["system", ["data_mode", "cache_cleanup_sec", "transcode_concurrency", "thumb_cache_mb", "folder_size_concurrency", "search_concurrency", "archive_max_mb"]],
+]
+
 export default function SettingsPage() {
   const q = useQuery({ queryKey: ["settings"], queryFn: api.settings })
   const [error, setError] = useState<string | null>(null)
+  const [tab, setTab] = useState("site")
   const form = useForm<Settings>({ resolver: zodResolver(schema) })
 
   useEffect(() => {
     if (q.data) form.reset(q.data)
   }, [q.data, form])
 
-  const submit = form.handleSubmit(async (v) => {
-    setError(null)
-    try {
-      const saved = await api.updateSettings(v)
-      queryClient.setQueryData(["settings"], saved)
-      queryClient.invalidateQueries({ queryKey: keys.config })
-      queryClient.invalidateQueries({ queryKey: ["list"] })
-      form.reset(saved)
-      toast.add({ title: "설정을 저장했습니다", type: "success", timeout: 2500 })
-    } catch (e) {
-      setError((e as Error).message)
-    }
-  })
+  const submit = form.handleSubmit(
+    async (v) => {
+      setError(null)
+      try {
+        const saved = await api.updateSettings(v)
+        queryClient.setQueryData(["settings"], saved)
+        queryClient.invalidateQueries({ queryKey: keys.config })
+        queryClient.invalidateQueries({ queryKey: ["list"] })
+        // An archive listing is cut at archive_max_mb and cached for ten minutes.
+        queryClient.invalidateQueries({ queryKey: ["archive"] })
+        form.reset(saved)
+        toast.add({ title: "설정을 저장했습니다", type: "success", timeout: 2500 })
+      } catch (e) {
+        setError((e as Error).message)
+      }
+    },
+    // An inactive tab panel is unmounted, so its field error would be invisible: saving would look
+    // like it did nothing. Show the tab that holds the first error instead of hiding it.
+    (errors) => {
+      const holding = TAB_FIELDS.find(([, fields]) => fields.some((f) => errors[f]))
+      if (holding) setTab(holding[0])
+    },
+  )
 
   if (q.isPending) return <Spinner />
   if (q.isError) {
@@ -91,7 +109,7 @@ export default function SettingsPage() {
         </Alert>
       ) : null}
 
-      <Tabs defaultValue="site">
+      <Tabs value={tab} onValueChange={(v) => setTab(String(v))}>
         <TabsList>
           <TabsTrigger value="site">사이트</TabsTrigger>
           <TabsTrigger value="preview">미리보기</TabsTrigger>

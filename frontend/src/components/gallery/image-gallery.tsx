@@ -18,6 +18,7 @@ import {
 import { useEffect, useMemo } from "react"
 
 import { urls, type Entry } from "@/lib/api"
+import { thumbnailable } from "@/lib/format"
 
 import { lgSizeFor } from "./ratios"
 
@@ -60,7 +61,9 @@ export default function ImageGallery({ images, index, onIndexChange, onClose }: 
     () =>
       images.map((e) => ({
         src: urls.raw(e.path),
-        thumb: urls.thumb(e.path, e.rev, "w128h128"),
+        // The thumbnail endpoint only renders formats Dropbox can thumbnail, so a .svg or .avif
+        // slide loads its own image instead of a 404 thumbnail.
+        thumb: thumbnailable(e.name) ? urls.thumb(e.path, e.rev, "w128h128") : urls.raw(e.path),
         lgSize: lgSizeFor(e.path),
         alt: e.name,
         // @lightgallery/react 3 renders caption as React text; subHtml is ignored by its renderer.

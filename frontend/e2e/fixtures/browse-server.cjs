@@ -57,12 +57,14 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
         entry("/synthetic/한글 #?%"),
         entry("/synthetic/raw#?%23.bin", "file"),
         entry("/synthetic/note#?%23.txt", "file"),
+        entry("/synthetic/archive.rar", "file"),
         entry("/synthetic/.env", "file"),
         entry("/synthetic/İ.mp4", "file"),
         entry("/synthetic/gallery"),
         entry("/synthetic/pages"),
         entry("/synthetic/a"),
         entry("/synthetic/b"),
+        entry("/synthetic/Sub"),
       ],
     ],
     [
@@ -70,6 +72,7 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
       [
         entry("/synthetic/gallery/#1 <b>tag.jpg", "file"),
         entry("/synthetic/gallery/A <b>B & C.jpg", "file"),
+        entry("/synthetic/gallery/vector.svg", "file"),
       ],
     ],
     ["/synthetic/normal", [entry("/synthetic/normal/child")]],
@@ -81,10 +84,15 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
     ],
     ["/synthetic/a", [entry("/synthetic/a/only-A")]],
     ["/synthetic/b", [entry("/synthetic/b/only-B")]],
+    // The same folder reached through two spellings, as the real server builds entry paths from
+    // the request path: the listing under /synthetic/sub keeps the lowercase request casing.
+    ["/synthetic/Sub", [entry("/synthetic/Sub/folderA")]],
+    ["/synthetic/sub", [entry("/synthetic/sub/folderA")]],
   ])
   const initialData = new Map([...data].map(([p, es]) => [p, [...es]]))
   let bMode = "ok",
     held = []
+  const sizeStreams = []
   const { createServer } = await imp("vite/dist/node/index.js")
   const { default: react } = await imp("@vitejs/plugin-react/dist/index.js")
   const { default: tailwind } = await imp("@tailwindcss/vite/dist/index.mjs")
@@ -134,6 +142,22 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
               storages = storages.filter((s) => s.id !== id)
               mounts = mounts.filter((m) => m.id !== id)
               return json({ ok: true })
+            }
+            if (u.pathname === "/api/fs/folder-size") {
+              const stream = { path: p, closed: false, res }
+              sizeStreams.push(stream)
+              res.writeHead(200, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-store",
+                Connection: "keep-alive",
+              })
+              res.write(
+                `event: progress\ndata: ${JSON.stringify({ bytes: 1024, files: 3, folders: 0, queued: false })}\n\n`
+              )
+              req.on("close", () => {
+                stream.closed = true
+              })
+              return
             }
             if (u.pathname === "/api/fs/stat") {
               const found = [...data.values()].flat().find((e) => e.path === p)
@@ -211,8 +235,20 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
     requests,
     data,
     held,
+    sizeStreams,
+    finishSize: (target, payload) => {
+      for (const stream of sizeStreams) {
+        if (stream.path !== target || stream.closed) continue
+        stream.res.write(`event: done\ndata: ${JSON.stringify(payload)}\n\n`)
+        stream.res.end()
+        stream.closed = true
+      }
+    },
     reset: () => {
       for (const x of held.splice(0)) x.res.destroy()
+      for (const stream of sizeStreams.splice(0)) {
+        if (!stream.closed) stream.res.end()
+      }
       bMode = "ok"
       mounts = [...initialMounts]
       storages = [...initialStorages]
