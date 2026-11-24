@@ -574,6 +574,61 @@ test("a deleted file closes the folder size stream it invalidates", async ({
   await expect(row.getByText("1.00 KB", { exact: true })).toHaveCount(0)
 })
 
+test("a slow backup file read cannot describe the file chosen after it", async ({
+  page,
+}) => {
+  await page.route("**/api/admin/backups/snapshots", (route) =>
+    route.fulfill({ json: { snapshots: [] } })
+  )
+  // A slow disk read is what lets the two selections overlap; nothing else is stubbed. The
+  // counter lets the test wait for both reads, and so for the stale continuation, without sleeping.
+  await page.addInitScript(() => {
+    const original = File.prototype.text
+    File.prototype.text = function () {
+      const wait = this.name.startsWith("slow-") ? 500 : 0
+      const scope = window as Window & { __fileReads?: number }
+      return new Promise((resolve, reject) =>
+        setTimeout(
+          () =>
+            original.call(this).then((value) => {
+              scope.__fileReads = (scope.__fileReads ?? 0) + 1
+              resolve(value)
+            }, reject),
+          wait
+        )
+      )
+    }
+  })
+  await page.goto(server.origin + "/admin/backup")
+  const input = page.getByLabel("백업 파일 선택", { exact: true })
+  const passwordField = page.getByLabel("복호화 비밀번호", { exact: true })
+  const encrypted = {
+    name: "slow-encrypted.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify({ encrypted: true })),
+  }
+  const plain = {
+    name: "plain.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify({ encrypted: false })),
+  }
+  await input.setInputFiles(encrypted)
+  await input.setInputFiles(plain)
+  await page.waitForFunction(
+    () => ((window as Window & { __fileReads?: number }).__fileReads ?? 0) >= 2
+  )
+  await expect(page.getByText("평문 백업", { exact: true })).toBeVisible()
+  await expect(page.getByText("암호화됨", { exact: true })).toHaveCount(0)
+
+  // A password entered for the encrypted file is meaningless for the plain one.
+  await input.setInputFiles(encrypted)
+  await expect(page.getByText("암호화됨", { exact: true })).toBeVisible()
+  await passwordField.fill("secret-pass")
+  await input.setInputFiles(plain)
+  await expect(page.getByText("평문 백업", { exact: true })).toBeVisible()
+  await expect(passwordField).toHaveValue("")
+})
+
 test("move dialog treats two spellings of one folder as the same destination", async ({
   page,
 }) => {
