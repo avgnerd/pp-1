@@ -238,6 +238,69 @@ func TestDeleteRevokes(t *testing.T) {
 	}
 }
 
+// TestClientBuildAfterDeleteIsNotPublished forces the interleaving in which Client has built a
+// client from the row and Delete has committed before that client is published. Publishing it
+// would put the deleted storage's client back into the cache and every later Client call would
+// keep answering for a storage that no longer exists.
+func TestClientBuildAfterDeleteIsNotPublished(t *testing.T) {
+	m, _, _ := newManager(t)
+	s := connectActiveStorage(t, m)
+
+	// buildClient is the first half of Client: it reads the row and builds the client.
+	built, err := m.buildClient(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Delete(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// cacheClient is the publish half Client runs after its build.
+	if _, err := m.cacheClient(s.ID, built); err == nil {
+		t.Fatal("the publish half accepted a client for the deleted storage")
+	}
+	if cached := cachedClientFor(m, s.ID); cached != nil {
+		t.Fatal("a client built before Delete was published for the deleted storage")
+	}
+	if _, err := m.Client(s.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Client after Delete = %v, want ErrNotFound", err)
+	}
+}
+
+// TestUpdateAndReauthReportRowDeletedAfterSnapshot models a Delete whose row write lands between
+// the snapshot read and the UPDATE: the snapshot still holds the row, the database does not.
+// Update must report the missing storage instead of returning a zero Storage with no error, and
+// Reauth must not start an authorization for a row that is gone.
+func TestUpdateAndReauthReportRowDeletedAfterSnapshot(t *testing.T) {
+	m, _, d := newManager(t)
+	s := connectActiveStorage(t, m)
+	if _, err := d.Exec(`DELETE FROM storages WHERE id = ?`, s.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.Update(s.ID, Input{Name: "gone", MountPath: "/gone", RootPath: "/", CacheTTLMin: 30})
+	if err == nil {
+		t.Fatalf("Update returned %+v and no error for a deleted row", got)
+	}
+	if got.ID != 0 {
+		t.Fatalf("Update returned a storage for a deleted row: %+v", got)
+	}
+	if _, ok := m.Get(s.ID); ok {
+		t.Fatal("Update left the deleted storage in the published snapshot")
+	}
+
+	if _, err := m.Reauth(s.ID, AuthLocalhost); err == nil {
+		t.Fatal("Reauth started an authorization for a deleted row")
+	}
+	var started int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM oauth_states WHERE storage_id = ?`, s.ID).Scan(&started); err != nil {
+		t.Fatal(err)
+	}
+	if started != 0 {
+		t.Fatalf("Reauth started %d authorizations for a deleted storage", started)
+	}
+}
+
 func TestSecretEncrypted(t *testing.T) {
 	m, _, d := newManager(t)
 	if _, err := m.Create(Input{MountPath: "/a", AppKey: "k", AppSecret: "super-secret"}); err != nil {
