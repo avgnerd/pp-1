@@ -54,6 +54,8 @@ export default function SettingsPage() {
       queryClient.setQueryData(["settings"], saved)
       queryClient.invalidateQueries({ queryKey: keys.config })
       queryClient.invalidateQueries({ queryKey: ["list"] })
+      // An archive listing is cut at archive_max_mb and cached for ten minutes.
+      queryClient.invalidateQueries({ queryKey: ["archive"] })
       form.reset(saved)
       toast.add({ title: "설정을 저장했습니다", type: "success", timeout: 2500 })
     } catch (e) {

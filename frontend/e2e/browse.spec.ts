@@ -505,3 +505,98 @@ test("out of range storage page canonicalizes to the last page", async ({
   await expect(page).toHaveURL(server.origin + "/?page=2")
   await expect(page.getByText("2개", { exact: true })).toBeVisible()
 })
+
+const settingsValues = {
+  robots_txt: "User-agent: *\nDisallow: /",
+  pagination_type: "pages",
+  per_page: 30,
+  audio_autoplay: false,
+  video_autoplay: false,
+  archive_preview: true,
+  cache_cleanup_sec: 120,
+  data_mode: "proxy",
+  transcode_concurrency: 2,
+  thumb_cache_mb: 256,
+  folder_size_concurrency: 2,
+  search_concurrency: 2,
+  archive_max_mb: 1,
+}
+
+/** Serves and stores the admin settings the settings page reads and writes. */
+async function stubAdminSettings(page: Page) {
+  let current: Record<string, unknown> = { ...settingsValues }
+  await page.route("**/api/admin/settings", async (route) => {
+    if (route.request().method() === "PUT") {
+      current = { ...current, ...(route.request().postDataJSON() as Record<string, unknown>) }
+      await route.fulfill({ json: current })
+      return
+    }
+    await route.fulfill({ json: current })
+  })
+  return { values: () => current }
+}
+
+async function openAdminSettings(page: Page) {
+  await page.evaluate(async () => {
+    const modulePath = "/src/router.tsx"
+    const { router } = await import(modulePath)
+    await router.navigate({ to: "/admin/settings" })
+  })
+  await expect(page.getByRole("heading", { name: "설정", exact: true })).toBeVisible()
+}
+
+test("saving a new archive size limit refreshes an open archive preview", async ({
+  page,
+}) => {
+  const settings = await stubAdminSettings(page)
+  let maxMb = 1
+  const budgetRequests: number[] = []
+  await page.route("**/api/fs/archive?**", async (route) => {
+    budgetRequests.push(maxMb)
+    await route.fulfill({
+      json: {
+        listing: {
+          format: "rar",
+          truncated: maxMb <= 1,
+          entries:
+            maxMb <= 1
+              ? [{ name: "first.txt", size: 10, dir: false }]
+              : [
+                  { name: "first.txt", size: 10, dir: false },
+                  { name: "beyond-the-limit.txt", size: 20, dir: false },
+                ],
+        },
+        sequential: true,
+        budget_mb: maxMb,
+      },
+    })
+  })
+  await page.goto(server.origin + "/synthetic/archive.rar")
+  await expect(
+    page.getByText("목록 일부만 표시합니다", { exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByRole("treeitem", { name: /beyond-the-limit\.txt/ })
+  ).toHaveCount(0)
+
+  await openAdminSettings(page)
+  await page.getByRole("tab", { name: "시스템", exact: true }).click()
+  await page.getByLabel("압축 파일 읽기 상한 (MB)", { exact: true }).fill("64")
+  const saved = page.waitForResponse(
+    (response) =>
+      response.request().method() === "PUT" &&
+      new URL(response.url()).pathname === "/api/admin/settings"
+  )
+  await page.getByRole("button", { name: "설정 저장", exact: true }).click()
+  await saved
+  maxMb = Number(settings.values().archive_max_mb)
+
+  await navigate(page, "synthetic/archive.rar")
+  await expect(
+    page.getByRole("treeitem", { name: /beyond-the-limit\.txt/ })
+  ).toBeVisible()
+  await expect(
+    page.getByText("목록 일부만 표시합니다", { exact: true })
+  ).toHaveCount(0)
+  expect(budgetRequests).toEqual([1, 64])
+})
