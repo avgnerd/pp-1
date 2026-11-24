@@ -37,15 +37,6 @@ type Streamer struct {
 	Cache *cache.Cache
 	Box   *secret.Box
 	HTTP  *http.Client
-
-	linkMu    sync.Mutex
-	linkLoads map[string]*tempLinkCall
-}
-
-type tempLinkCall struct {
-	done chan struct{}
-	link string
-	err  error
 }
 
 // New creates a streamer.
@@ -76,64 +67,26 @@ func (s *Streamer) TempLink(ctx context.Context, t vfs.Target) (string, error) {
 	return link, nil
 }
 
-// sharedTempLink returns a cached temporary link or loads one on the shared load path.
+// sharedTempLink returns a cached temporary link or loads one on the shared load path. That path
+// owns the policy: one load per key with a detached context bounded by tempLinkLoadTimeout, and a
+// result a removal overtook is returned to the callers already waiting on it but not cached, so a
+// link minted for the state a rename, a refresh or a restore replaced cannot come back.
 func (s *Streamer) sharedTempLink(ctx context.Context, key string, load func(context.Context) (string, error)) (string, error) {
-	if v, ok := s.Cache.Get(key); ok {
-		if link, ok := v.(string); ok {
-			return link, nil
+	v, err := s.Cache.GetOrLoad(ctx, key, tempLinkLoadTimeout, func(ctx context.Context) (any, int64, time.Duration, error) {
+		link, err := load(ctx)
+		if err != nil {
+			return nil, 0, 0, err
 		}
-	}
-
-	s.linkMu.Lock()
-	if v, ok := s.Cache.Get(key); ok {
-		if link, ok := v.(string); ok {
-			s.linkMu.Unlock()
-			return link, nil
-		}
-	}
-	if call := s.linkLoads[key]; call != nil {
-		s.linkMu.Unlock()
-		return waitTempLink(ctx, call)
-	}
-	if err := ctx.Err(); err != nil {
-		s.linkMu.Unlock()
+		return link, int64(len(link)), TempLinkTTL, nil
+	})
+	if err != nil {
 		return "", err
 	}
-	call := &tempLinkCall{done: make(chan struct{})}
-	if s.linkLoads == nil {
-		s.linkLoads = make(map[string]*tempLinkCall)
+	link, ok := v.(string)
+	if !ok {
+		return "", errors.New("stream: temporary link cache entry is not a string")
 	}
-	s.linkLoads[key] = call
-	s.linkMu.Unlock()
-
-	go s.loadTempLink(key, call, load)
-	return waitTempLink(ctx, call)
-}
-
-func (s *Streamer) loadTempLink(key string, call *tempLinkCall, load func(context.Context) (string, error)) {
-	ctx, cancel := context.WithTimeout(context.Background(), tempLinkLoadTimeout)
-	defer cancel()
-	link, err := load(ctx)
-	if err == nil {
-		s.Cache.Set(key, link, int64(len(link)), TempLinkTTL)
-	}
-
-	s.linkMu.Lock()
-	call.link, call.err = link, err
-	if s.linkLoads[key] == call {
-		delete(s.linkLoads, key)
-	}
-	close(call.done)
-	s.linkMu.Unlock()
-}
-
-func waitTempLink(ctx context.Context, call *tempLinkCall) (string, error) {
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-call.done:
-		return call.link, call.err
-	}
+	return link, nil
 }
 
 // ContentType guesses a MIME type from the file name, with fixes for common media types

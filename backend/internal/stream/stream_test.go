@@ -115,6 +115,52 @@ func TestSharedTempLinkIsolatedFromCallerCancel(t *testing.T) {
 	}
 }
 
+// A temporary link minted before a removal belongs to the state the removal replaced: a 410
+// refresh, a rename, or a restore. The callers waiting on that load get the link, but it must not
+// be cached again afterwards, or the replaced state is served for the rest of the link's TTL.
+func TestTempLinkNotCachedAfterInvalidation(t *testing.T) {
+	c := cache.New(1000, 1<<20, time.Hour)
+	defer c.Stop()
+	s := &Streamer{Cache: c}
+	key := vfs.TempLinkKey(7, "/movie.mp4")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	load := func(context.Context) (string, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			return "stale-link", nil
+		}
+		return "fresh-link", nil
+	}
+
+	firstDone := make(chan string, 1)
+	go func() {
+		link, _ := s.sharedTempLink(context.Background(), key, load)
+		firstDone <- link
+	}()
+	<-started
+	c.Delete(key)
+	close(release)
+	select {
+	case got := <-firstDone:
+		if got != "stale-link" {
+			t.Fatalf("caller got link %q, want the link its load read", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the temporary link load did not finish")
+	}
+	if v, ok := c.Get(key); ok {
+		t.Fatalf("the invalidated temporary link was cached again: %v", v)
+	}
+	link, err := s.sharedTempLink(context.Background(), key, load)
+	if err != nil || link != "fresh-link" {
+		t.Fatalf("after invalidation got link %q err %v, want a freshly loaded link", link, err)
+	}
+}
+
 type streamRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f streamRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
