@@ -326,7 +326,10 @@ func (s *Server) archiveList(c *gin.Context) {
 		fail(c, badRequest("지원하지 않는 압축 형식입니다"))
 		return
 	}
-	key := fmt.Sprintf("s:%d:arc:%s:%s", t.Storage.ID, strings.ToLower(t.DbxPath), e.Rev)
+	// The read budget is part of the key: a listing cut off under the old archive_max_mb is a
+	// different answer from the one the current limit asks for, and a cached list would keep
+	// telling the admin to raise a limit that is already raised.
+	key := fmt.Sprintf("s:%d:arc:%s:%s:%d", t.Storage.ID, strings.ToLower(t.DbxPath), e.Rev, st.ArchiveMaxMB)
 	v, err := s.Cache.GetOrLoad(c.Request.Context(), key, archiveLoadTimeout, func(ctx context.Context) (any, int64, time.Duration, error) {
 		ra := s.Stream.ReaderAtFor(ctx, t, *e.Size)
 		l, err := archive.List(format, ra, *e.Size, int64(st.ArchiveMaxMB)<<20)

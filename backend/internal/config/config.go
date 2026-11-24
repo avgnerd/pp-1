@@ -244,17 +244,29 @@ func (c *Config) SecureCookies() bool {
 // X-Forwarded-Proto of https counts only when the request arrived from a configured trusted proxy,
 // because any other client can set that header itself.
 func (c *Config) SecureRequest(r *http.Request) bool {
-	if c.SecureCookies() || r.TLS != nil {
-		return true
+	return c.SecureCookies() || c.Scheme(r) == "https"
+}
+
+// Scheme reports the protocol the request arrived on: the listener's TLS state, or the forwarded
+// protocol of a configured trusted proxy. It says nothing about a configured public_url, so a
+// caller building a URL keeps using the URL the request came in on.
+func (c *Config) Scheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
 	}
-	if !c.TrustedProxy(r.RemoteAddr) {
-		return false
+	if c.TrustedProxy(r.RemoteAddr) && strings.EqualFold(forwardedProto(r.Header.Get("X-Forwarded-Proto")), "https") {
+		return "https"
 	}
-	proto := r.Header.Get("X-Forwarded-Proto")
-	if i := strings.IndexByte(proto, ','); i >= 0 {
-		proto = proto[:i]
+	return "http"
+}
+
+// forwardedProto returns the protocol a proxy reported. A chain appends its hops to one
+// comma-separated header, so the first value is the one the client used.
+func forwardedProto(v string) string {
+	if i := strings.IndexByte(v, ','); i >= 0 {
+		v = v[:i]
 	}
-	return strings.EqualFold(strings.TrimSpace(proto), "https")
+	return strings.TrimSpace(v)
 }
 
 // TrustedProxy reports whether remoteAddr is one of the configured trusted proxies, given as an IP

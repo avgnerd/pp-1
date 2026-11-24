@@ -42,7 +42,9 @@ func ApplyTx(ctx context.Context, d *sql.DB, p *Payload, opts ApplyOptions) erro
 	nowUnix := now().Unix()
 
 	// Step 2: reseal every credential with this instance's master key before the transaction
-	// starts, so an encryption failure cannot touch the database.
+	// starts, so an encryption failure cannot touch the database. A pending storage has no refresh
+	// token yet and refresh_token_enc is nullable, so an empty token stays nil and is stored as
+	// NULL, which the OAuth completion later replaces.
 	type storageRow struct {
 		rec        StorageRecord
 		appSecret  []byte
@@ -202,8 +204,11 @@ func defaultInt(v, def int) int {
 	return v
 }
 
-// blobOrEmpty keeps the NOT NULL app_secret_enc column satisfied for a pending storage, which has
-// no credential to seal yet.
+// blobOrEmpty keeps the NOT NULL app_secret_enc column satisfied when a payload carries no app
+// secret. ValidatePayload refuses that shape for every storage, pending ones included, so this
+// only answers a caller that applies an unvalidated payload. The stored blob is empty and cannot
+// be opened, which leaves that storage failing at its OAuth completion until it is deleted and
+// created again.
 func blobOrEmpty(b []byte) []byte {
 	if b == nil {
 		return []byte{}

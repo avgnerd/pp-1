@@ -76,8 +76,59 @@ func hlsInitRestartHelper() int {
 			return 2
 		}
 		return 0
+	case "coarse-tick":
+		if start != 0 || !writeInitRestartFile("init.mp4", initRestartInitBytes) ||
+			!writeInitRestartFile("seg0.m4s", initRestartSegBytes) {
+			return 2
+		}
+		if !stampInitRestartOutputs("init.mp4", "seg0.m4s") {
+			return 2
+		}
+		ready, release := os.Getenv(initRestartReadyPath), os.Getenv(initRestartReleasePath)
+		if ready == "" || release == "" || os.WriteFile(ready, []byte("ready"), 0o600) != nil {
+			return 2
+		}
+		if !waitInitRestartRelease(release) {
+			return 2
+		}
+		return 1
 	}
 	return 2
+}
+
+// stampInitRestartOutputs gives the run's outputs the timestamp the session filesystem recorded for
+// the run it belongs to: a filesystem whose clock is coarser than the wall clock stamps a file the
+// run just wrote at the tick that was current when the run started. A build that records no such
+// boundary has no filesystem reading to use, so one second back stands in for that tick.
+func stampInitRestartOutputs(names ...string) bool {
+	at := time.Now().Add(-time.Second)
+	if st, err := os.Stat(runBoundaryFile); err == nil {
+		at = st.ModTime()
+	}
+	for _, name := range names {
+		if os.Chtimes(name, at, at) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// waitInitRestartRelease holds the helper run open until the test releases it.
+func waitInitRestartRelease(path string) bool {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if _, err := os.Stat(path); err == nil {
+				return true
+			}
+		case <-timeout.C:
+			return false
+		}
+	}
 }
 
 func writeInitRestartFile(name, valueEnv string) bool {

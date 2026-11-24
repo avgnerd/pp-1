@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -217,11 +218,15 @@ func parseSnapshotName(name string) (snapshotPart, bool) {
 	}
 	part := snapshotPart{name: name, at: at, seq: 1}
 	if rest := body[len(snapshotTimeForm):]; rest != "" {
-		if !strings.HasPrefix(rest, "-") {
+		// Only the exact text snapshotName renders is a snapshot of ours. Scanning the number
+		// would stop at the first non-digit and count a file the admin kept beside the snapshots,
+		// such as "-2_keep.json", as one of ours, which PruneSnapshots then deletes.
+		digits, ok := strings.CutPrefix(rest, "-")
+		if !ok {
 			return snapshotPart{}, false
 		}
-		var seq int
-		if _, err := fmt.Sscanf(rest, "-%d", &seq); err != nil || seq < 2 {
+		seq, err := strconv.Atoi(digits)
+		if err != nil || seq < 2 || strconv.Itoa(seq) != digits {
 			return snapshotPart{}, false
 		}
 		part.seq = seq
