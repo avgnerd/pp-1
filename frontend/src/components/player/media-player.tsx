@@ -256,7 +256,9 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
     if (isAudio || vrOn || plan.kind !== "original" || !transcode || autoSwitched.current || !src) return
     let window: FrameSample[] = []
     const reset = () => (window = [])
-    const v = videoRef.current
+    // The element state, not the ref: an effect that ran before the video was rendered (a probe
+    // that failed while the player showed a skeleton) has to attach its listeners once it exists.
+    const v = video
     v?.addEventListener("seeking", reset)
     v?.addEventListener("pause", reset)
     const timer = setInterval(() => {
@@ -287,7 +289,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
       v?.removeEventListener("seeking", reset)
       v?.removeEventListener("pause", reset)
     }
-  }, [isAudio, vrOn, plan.kind, transcode, src, probeData, keepPlaying])
+  }, [isAudio, vrOn, plan.kind, transcode, src, probeData, keepPlaying, video])
 
   const mediaEvents = {
     onPlay: () => { resumePlay.current = true },
