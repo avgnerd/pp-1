@@ -47,7 +47,7 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/mounts') return send([])
     if (u.pathname === '/api/fs/stat') return send(entries.find(e => e.path === u.searchParams.get('path')) || entries[0])
     if (u.pathname === '/api/fs/siblings') return send(entries)
-    if (u.pathname === '/api/media/probe') return send({ probe: { format: 'mp4', duration, bitrate: 100000, video: { index: 0, codec_type: 'video', codec_name: 'h264', width: 160, height: 90, pix_fmt: 'yuv420p' }, vr: { projection: '', stereo: 'mono', source: '' } }, transcode: true })
+    if (u.pathname === '/api/media/probe') return send({ probe: { format: 'mp4', duration, bitrate: 100000, video: { index: 0, codec_type: 'video', codec_name: 'h264', width: 1920, height: 1080, pix_fmt: 'yuv420p' }, vr: { projection: '', stereo: 'mono', source: '' } }, transcode: true })
     if (u.pathname === '/api/media/hls') {
       let body = ''
       for await (const chunk of req) body += chunk

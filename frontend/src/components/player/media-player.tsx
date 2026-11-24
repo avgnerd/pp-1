@@ -18,7 +18,7 @@ import { VideoSkin } from "@/components/videojs/video/skin"
 import { api, urls, type Entry, type Probe } from "@/lib/api"
 import { fileKind } from "@/lib/format"
 import { toSplat } from "@/lib/paths"
-import { useConfig } from "@/lib/queries"
+import { queryClient, useConfig } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 import { usePrefs, type Quality } from "@/stores/ui"
 
@@ -27,12 +27,19 @@ import { AutoNextButton, ChoiceSubmenu, NextButton, PotPlayerButton, PrevButton,
 import { VRView, type Projection, type Stereo } from "./vr-view"
 
 // Sessions are closed shortly after the player unmounts; a quick remount (React StrictMode,
-// route re-render) reuses the same session instead.
+// route re-render) reuses the same session instead. Once the session is closed its cached answer has
+// to go too: a remount more than two seconds later would otherwise reuse a session id the server no
+// longer has, and every segment request would answer 410.
 const pendingClose = new Map<string, ReturnType<typeof setTimeout>>()
 function scheduleClose(id: string) {
+  // A second cleanup for the same session must not leave a timer that closes a session a later
+  // player instance has already kept open.
+  const pending = pendingClose.get(id)
+  if (pending) clearTimeout(pending)
   pendingClose.set(id, setTimeout(() => {
     pendingClose.delete(id)
     api.hlsClose(id).catch(() => {})
+    queryClient.removeQueries({ queryKey: ["hls"], predicate: (q) => (q.state.data as { id?: string } | null | undefined)?.id === id })
   }, 2000))
 }
 function keepOpen(id: string) {
@@ -41,12 +48,29 @@ function keepOpen(id: string) {
   pendingClose.delete(id)
 }
 
+/**
+ * The JSON code of a failed HLS response, such as "past_end". hls.js reports a 4xx without a parsed
+ * body: `response.data` is unset and `response.text` is the status text, so the body comes from the
+ * XHR. Playlist requests ask for text, segment and init requests for an array buffer.
+ */
+function hlsErrorCode(details: unknown): string | undefined {
+  if (!(details instanceof XMLHttpRequest)) return undefined
+  try {
+    const text = details.responseType === "arraybuffer" ? new TextDecoder().decode(details.response as ArrayBuffer) : details.responseText
+    const body = JSON.parse(text) as { code?: unknown }
+    return typeof body?.code === "string" ? body.code : undefined
+  } catch {
+    return undefined
+  }
+}
+
 type VRMode = "off" | `${Projection}-${Stereo}`
 
 // hls.js gives up on a fragment after 10 s without a first byte by default. After a seek the
 // server may need longer to start ffmpeg and encode the first segment (it waits up to 60 s).
-// The server answers 410 for a gone session or a segment past the end. hls.js would retry those
-// for about 30 s before giving up, so the player reacts to the first one (see onHlsMedia).
+// The server answers 410 both for a session that is gone and for a segment past the end; the JSON
+// code in the body tells them apart, and hls.js does not retry either 4xx. The player reacts to the
+// first one (see onHlsMedia).
 const loadPolicy = {
   default: {
     maxTimeToFirstByteMs: 45_000,
@@ -141,6 +165,20 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
     resumePlay.current = !el.paused && !el.ended
     resumeRate.current = el.playbackRate
     restoringFrom.current = el
+  }, [])
+  // The media ended (a segment past the end), so there is nothing left to load: stop here and report
+  // the end so the auto-next preference and the player's end state work. The session stays alive
+  // until the player unmounts; reopening one would end at the same place. The element cannot reach
+  // the playlist's last second (the real media ends earlier), so the ended event is raised here
+  // rather than by playback reaching the end.
+  const endHlsPlayback = useCallback(() => {
+    const el = videoRef.current ?? audioRef.current
+    if (!el) return
+    hlsRetries.current = 0
+    resumePlay.current = false
+    restoringFrom.current = null
+    el.pause()
+    el.dispatchEvent(new Event("ended"))
   }, [])
   useEffect(() => {
     if (!hlsId) return
@@ -377,6 +415,12 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
       const onErr: Parameters<typeof engine.on<typeof Hls.Events.ERROR>>[1] = (_e, data) => {
         if (hlsMedia.current !== m || data.fatal || data.response?.code !== 410) return
         engine.stopLoad()
+        // past_end is the media ending while the session is still alive; only a gone session needs
+        // another one.
+        if (hlsErrorCode(data.networkDetails) === "past_end") {
+          endHlsPlayback()
+          return
+        }
         onGone.current(() => engine.trigger(Hls.Events.ERROR, {
           ...data,
           fatal: true,
@@ -392,7 +436,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
       clearTimeout(timer)
       off()
     }
-  }, [])
+  }, [endHlsPlayback])
 
   const srcH = probeData?.video?.height ?? 0
   const qualityChoices = [

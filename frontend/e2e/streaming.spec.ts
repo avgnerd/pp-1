@@ -434,7 +434,7 @@ for (const playing of [false, true]) {
       await page.route("**/seg*.ts", async route => {
         failedMedia.push(await page.locator("video").evaluate((v: HTMLVideoElement) => ({ time: v.currentTime, rate: v.playbackRate, paused: v.paused, ready: v.readyState, frames: v.getVideoPlaybackQuality().totalVideoFrames })))
         failures++
-        await route.fulfill({ status: 410, json: { code: "past_end" } })
+        await route.fulfill({ status: 410, json: { code: "session_gone" } })
       })
       await seekVideo.evaluate((v: HTMLVideoElement, target) => { v.currentTime = target }, seekTarget)
       const retry = page.getByRole("button", { name: "다시 재생", exact: true })
@@ -504,7 +504,7 @@ for (const playing of [false, true]) {
 }
 
 for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { playing: true, fullscreen: false }, { playing: true, fullscreen: true }]) {
-  test(`persistent past-end failures show a retry action and recover ${playing ? "playing" : "paused"} playback${fullscreen ? " in native fullscreen" : ""}`, async ({ page }) => {
+  test(`persistent session failures show a retry action and recover ${playing ? "playing" : "paused"} playback${fullscreen ? " in native fullscreen" : ""}`, async ({ page }) => {
     test.setTimeout(90_000)
     await ready(page)
     await convert(page)
@@ -538,7 +538,7 @@ for (const { playing, fullscreen } of [{ playing: false, fullscreen: false }, { 
       const segment = /seg(\d+)\.ts$/.exec(new URL(route.request().url()).pathname)
       if (!healthy && segment && Number(segment[1]) >= 50) {
         failures++
-        await route.fulfill({ status: 410, json: { code: "past_end" } })
+        await route.fulfill({ status: 410, json: { code: "session_gone" } })
       } else await route.continue()
     })
     const seekVideo = playing ? sampleVideo : null
@@ -650,7 +650,7 @@ test("a terminal failure reopens the dialog while its close transition is still 
     const segment = /seg(\d+)\.ts$/.exec(new URL(route.request().url()).pathname)
     if (segment && Number(segment[1]) >= 50) {
       failures++
-      await route.fulfill({ status: 410, json: { code: "past_end" } })
+      await route.fulfill({ status: 410, json: { code: "session_gone" } })
     } else await route.continue()
   })
   await page.locator("video").evaluate((v: HTMLVideoElement) => { v.pause(); v.currentTime = 200 })
@@ -706,7 +706,7 @@ test("returning to a cached HLS source clears the previous terminal failure", as
   await page.route("**/seg*.ts", async route => {
     const segment = /seg(\d+)\.ts$/.exec(new URL(route.request().url()).pathname)
     if (!healthy && segment && Number(segment[1]) >= 50) {
-      await route.fulfill({ status: 410, json: { code: "past_end" } })
+      await route.fulfill({ status: 410, json: { code: "session_gone" } })
     } else await route.continue()
   })
   await page.locator("video").evaluate((v: HTMLVideoElement) => { v.pause(); v.currentTime = 200 })
@@ -1337,6 +1337,75 @@ test("a current HLS recovery reloads an unchanged playlist while retaining pause
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeCloseTo(200)
+})
+
+// A segment past the end of the media answers 410 past_end, which means the media ended and the
+// session is still alive. Recovering from it opens a session that ends at the same place, so the
+// player must finish playback instead: no retry dialog, no second session, no lost position.
+test("a segment past the end ends playback without opening another session", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("dvfs-prefs", JSON.stringify({ state: { autoNext: false, quality: "original" }, version: 0 })))
+  await ready(page)
+  const opens: string[] = []
+  page.on("response", response => {
+    if (response.request().method() !== "POST" || new URL(response.url()).pathname !== "/api/media/hls") return
+    void response.json().then((body: { id?: string }) => { if (body?.id) opens.push(body.id) }).catch(() => {})
+  })
+  await convert(page)
+  await expect.poll(() => opens.length).toBe(1)
+  let failures = 0
+  await page.route("**/seg*.ts", async route => {
+    const segment = /seg(\d+)\.ts$/.exec(new URL(route.request().url()).pathname)
+    if (segment && Number(segment[1]) >= 59) {
+      failures++
+      await route.fulfill({ status: 410, json: { code: "past_end" } })
+    } else await route.continue()
+  })
+  await page.locator("video").evaluate(async (v: HTMLVideoElement) => { v.playbackRate = 1.75; await v.play(); v.currentTime = 230 })
+  await expect.poll(() => failures).toBeGreaterThanOrEqual(1)
+  await expect(page.getByRole("button", { name: "Play", exact: true }), "a past-end segment stops playback").toBeVisible()
+  await expect(page.getByRole("alertdialog")).toHaveCount(0)
+  expect(opens).toHaveLength(1)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
+  // The frame the user was at, not a reset to the start and not a seek into data that does not exist.
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(229)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
+})
+
+// The session a player leaves is closed two seconds later, while its query data lives for five.
+// Changing the height changes the query key, so coming back inside that window must not read the
+// closed session out of the cache: it would replay a session the server no longer has.
+test("a closed session is not reused by a quality switch inside the cache window", async ({ page }) => {
+  await ready(page)
+  const opened: { id: string; height: number }[] = []
+  const playlists: string[] = []
+  page.on("response", response => {
+    if (response.request().method() !== "POST" || new URL(response.url()).pathname !== "/api/media/hls") return
+    const height = (response.request().postDataJSON() as { height?: number } | null)?.height ?? 0
+    void response.json().then((body: { id?: string }) => { if (body?.id) opened.push({ id: body.id, height }) }).catch(() => {})
+  })
+  page.on("request", request => {
+    const path = new URL(request.url()).pathname
+    if (path.endsWith("/index.m3u8")) playlists.push(path)
+  })
+  await convert(page)
+  await expect.poll(() => opened.length).toBe(1)
+  const first = opened[0]
+  expect(first.height).toBe(1080)
+  const closed = page.waitForRequest(request => request.method() === "DELETE" && new URL(request.url()).pathname === `/api/media/hls/${first.id}`, { timeout: 15_000 })
+  await openSubmenu(page, /화질/)
+  await page.getByRole("menuitemradio", { name: "720p", exact: true }).click()
+  await page.keyboard.press("Escape")
+  await expect.poll(() => opened.length).toBe(2)
+  expect(opened[1].height).toBe(720)
+  await closed
+  const mark = playlists.length
+  await openSubmenu(page, /화질/)
+  await page.getByRole("menuitemradio", { name: /변환 재생/ }).click()
+  await page.keyboard.press("Escape")
+  await expect.poll(() => opened.filter(entry => entry.height === 1080).length, { timeout: 10_000 }).toBe(2)
+  expect(opened.filter(entry => entry.height === 1080)[1].id).not.toBe(first.id)
+  expect(playlists.slice(mark).filter(path => path.startsWith(`/media/${first.id}/`))).toEqual([])
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
 })
 
 // The heartbeat keeps a paused player's session alive, so an interval that a render restarts before
