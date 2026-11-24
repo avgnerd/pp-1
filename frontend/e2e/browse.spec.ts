@@ -506,6 +506,28 @@ test("out of range storage page canonicalizes to the last page", async ({
   await expect(page.getByText("2개", { exact: true })).toBeVisible()
 })
 
+test("move dialog treats two spellings of one folder as the same destination", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic/sub")
+  await expect(link(page, "folderA")).toBeVisible()
+  await page.getByRole("checkbox", { name: "folderA 선택", exact: true }).check()
+  await page.getByRole("button", { name: "이동", exact: true }).click()
+  const dialog = page.getByRole("dialog")
+  await expect(
+    dialog.getByRole("button", { name: "이미 이 폴더에 있습니다" })
+  ).toBeVisible()
+  await dialog.getByRole("button", { name: "상위 폴더", exact: true }).click()
+  // The parent lists the folder by its real name; the moved entry kept the lowercase request path.
+  await dialog.getByRole("button", { name: "Sub", exact: true }).click()
+  await expect(
+    dialog.getByRole("button", { name: "이미 이 폴더에 있습니다" })
+  ).toBeVisible()
+  await expect(
+    dialog.getByRole("button", { name: "folderA", exact: true })
+  ).toHaveCount(0)
+})
+
 const settingsValues = {
   robots_txt: "User-agent: *\nDisallow: /",
   pagination_type: "pages",

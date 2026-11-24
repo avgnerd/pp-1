@@ -151,11 +151,11 @@ function DestinationPicker({ mode, entries, onClose }: { mode: "move" | "copy"; 
   const folders = useQuery({
     queryKey: ["picker", dir],
     queryFn: () => api.list(dir, { sort: "name", order: "asc" }),
-    select: (r) => r.entries.filter((e) => e.type === "folder" && !entries.some((s) => s.path === e.path)),
+    select: (r) => r.entries.filter((e) => e.type === "folder" && !entries.some((s) => samePath(s.path, e.path))),
   })
 
   const verb = mode === "move" ? "이동" : "복사"
-  const sameDir = mode === "move" && entries.every((e) => parentPath(e.path) === dir)
+  const sameDir = mode === "move" && entries.every((e) => samePath(parentPath(e.path), dir))
 
   const run = async () => {
     setBusy(true)

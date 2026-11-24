@@ -83,6 +83,10 @@ exports.startBrowseServer = async function ({ repo, root, appRoot }) {
     ],
     ["/synthetic/a", [entry("/synthetic/a/only-A")]],
     ["/synthetic/b", [entry("/synthetic/b/only-B")]],
+    // The same folder reached through two spellings, as the real server builds entry paths from
+    // the request path: the listing under /synthetic/sub keeps the lowercase request casing.
+    ["/synthetic/Sub", [entry("/synthetic/Sub/folderA")]],
+    ["/synthetic/sub", [entry("/synthetic/sub/folderA")]],
   ])
   const initialData = new Map([...data].map(([p, es]) => [p, [...es]]))
   let bMode = "ok",
