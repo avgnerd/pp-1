@@ -86,15 +86,63 @@ func (b *budgetReader) Read(p []byte) (int, error) {
 
 func (b *budgetReader) Seek(off int64, whence int) (int64, error) { return b.r.Seek(off, whence) }
 
+// readBudget stops r once max bytes have been read. The gzip stream is wrapped in it so the budget
+// bounds the decompressed bytes too, not just the compressed source; every read the tar reader
+// makes, including a PAX header it declares, passes through the cap before it can allocate.
+type readBudget struct {
+	r    io.Reader
+	read int64
+	max  int64
+	eof  bool // the stream ended exactly at max
+	over bool // the stream continued past max
+}
+
+func (b *readBudget) Read(p []byte) (int, error) {
+	if b.read >= b.max {
+		if b.eof {
+			return 0, io.EOF
+		}
+		if b.over {
+			return 0, ErrBudget
+		}
+		// A stream can end exactly at max, and tar only learns that from an EOF, so probe one
+		// byte before calling the listing truncated. The probe byte is discarded.
+		var probe [1]byte
+		if n, err := b.r.Read(probe[:]); n == 0 && errors.Is(err, io.EOF) {
+			b.eof = true
+			return 0, io.EOF
+		}
+		b.over = true
+		return 0, ErrBudget
+	}
+	if rem := b.max - b.read; int64(len(p)) > rem {
+		p = p[:rem]
+	}
+	n, err := b.r.Read(p)
+	b.read += int64(n)
+	return n, err
+}
+
+// normalizeEntryName converts Windows separators to "/" and strips the repeated leading "./" that
+// `tar -czf archive.tgz .` writes, so an explicit "./src/" and the folder implied by
+// "./src/main.go" compare as the same name.
+func normalizeEntryName(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	for strings.HasPrefix(name, "./") {
+		name = strings.TrimPrefix(name, "./")
+	}
+	return strings.TrimPrefix(name, "/")
+}
+
 // List reads an archive. budget bounds bytes read for sequential formats.
 func List(format string, ra io.ReaderAt, size, budget int64) (*Listing, error) {
-	l := &Listing{Format: format}
+	l := &Listing{Format: format, Entries: []Entry{}}
 	add := func(e Entry) bool {
 		if len(l.Entries) >= MaxEntries {
 			l.Truncated = true
 			return false
 		}
-		e.Name = strings.TrimPrefix(strings.ReplaceAll(e.Name, "\\", "/"), "/")
+		e.Name = normalizeEntryName(e.Name)
 		if e.Name == "" {
 			return true
 		}
@@ -111,8 +159,9 @@ func List(format string, ra io.ReaderAt, size, budget int64) (*Listing, error) {
 			if f.Flags&0x1 != 0 {
 				l.Encrypted = true
 			}
+			name := strings.ReplaceAll(f.Name, "\\", "/")
 			if !add(Entry{Name: f.Name, Size: int64(f.UncompressedSize64), Packed: int64(f.CompressedSize64),
-				Modified: f.Modified.UTC().Format(time.RFC3339), Dir: strings.HasSuffix(f.Name, "/")}) {
+				Modified: f.Modified.UTC().Format(time.RFC3339), Dir: f.FileInfo().IsDir() || strings.HasSuffix(name, "/")}) {
 				break
 			}
 		}
@@ -144,7 +193,7 @@ func List(format string, ra io.ReaderAt, size, budget int64) (*Listing, error) {
 				return nil, fmt.Errorf("gzip 파일을 읽을 수 없습니다: %w", err)
 			}
 			defer gz.Close()
-			r = gz
+			r = &readBudget{r: gz, max: budget}
 		}
 		tr := tar.NewReader(r)
 		for {
