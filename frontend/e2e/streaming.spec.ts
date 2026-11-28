@@ -356,10 +356,13 @@ test("a direct URL holds the skeleton until config resolves and then autoplays",
   page.on("request", request => {
     if (new URL(request.url()).pathname === "/api/fs/raw") raw.push(request.url())
   })
+  const playerChunk = page.waitForResponse(response => /\/media-player-[^/]+\.js$/.test(new URL(response.url()).pathname))
   await page.goto("/demo.mp4")
+  await playerChunk
   await expect.poll(() => configPending).toBe(true)
-  // The lazy player has mounted by now: without the fix it would already have a video element and
-  // an original-stream request, both created from the pending config's defaults.
+  // The lazy player chunk has loaded, so its own render is what decides the DOM below: without the
+  // fix it would already have a video element and an original-stream request, both created from
+  // the pending config's defaults.
   await expect(page.locator('[data-slot="skeleton"].aspect-video').first()).toBeVisible()
   await page.waitForTimeout(1_000)
   await expect(page.locator("video")).toHaveCount(0)
@@ -1469,6 +1472,11 @@ test("a segment past the end ends playback without opening another session", asy
     if (response.request().method() !== "POST" || new URL(response.url()).pathname !== "/api/media/hls") return
     void response.json().then((body: { id?: string }) => { if (body?.id) opens.push(body.id) }).catch(() => {})
   })
+  const mediaSessions = new Set<string>()
+  page.on("request", request => {
+    const session = /^\/media\/([^/]+)\//.exec(new URL(request.url()).pathname)
+    if (session) mediaSessions.add(session[1])
+  })
   await convert(page)
   await expect.poll(() => opens.length).toBe(1)
   let failures = 0
@@ -1505,6 +1513,27 @@ test("a segment past the end ends playback without opening another session", asy
   expect(opens).toHaveLength(1)
   const restartedAt = await page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(restartedAt + 0.5)
+
+  // Pressing the player's Play at the retained end is a replay, not a seek. It has to restart from
+  // the beginning; starting a load at the stopped position would fetch the past_end segment again.
+  const beforeSecondEnd = failures
+  await page.locator("video").evaluate((v: HTMLVideoElement) => {
+    v.currentTime = 230
+    v.play().catch(() => {})
+  })
+  await expect.poll(() => failures).toBeGreaterThan(beforeSecondEnd)
+  const play = page.getByRole("button", { name: "Play", exact: true })
+  await expect(play, "a second past-end segment stops playback again").toBeVisible()
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
+  const replayMark = restartedSegments.length
+  await play.click()
+  await expect.poll(() => restartedSegments.slice(replayMark).some(n => n < 10)).toBe(true)
+  // Past 0.5 s after the restart, and no longer at the retained end.
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime < 5)).toBe(true)
+  const replayAt = await page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(replayAt + 0.5)
+  expect(opens).toHaveLength(1)
+  expect([...mediaSessions]).toEqual([opens[0]])
 })
 
 // The session a player leaves is closed two seconds later, while its query data lives for five.

@@ -164,6 +164,9 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
     resumeRate.current = el.playbackRate
     restoringFrom.current = el
   }, [])
+  // Where a past_end stop left the element. Pressing Play there has no new position to load, so a
+  // replay has to restart from the beginning instead of asking for the same absent segment again.
+  const pastEndAt = useRef(0)
   // The media ended (a segment past the end), so there is nothing left to load: stop here and report
   // the end so the auto-next preference and the player's end state work. The session stays alive
   // until the player unmounts; reopening one would end at the same place. The element cannot reach
@@ -172,6 +175,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
   const endHlsPlayback = useCallback(() => {
     const el = videoRef.current ?? audioRef.current
     if (!el) return
+    pastEndAt.current = el.currentTime
     resumePlay.current = false
     restoringFrom.current = null
     el.pause()
@@ -252,11 +256,14 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
   // to start it again: hls.js ignores moving out of STOPPED on its own and the adapter does not
   // reload a source it has already started.
   const hlsStopped = useRef(false)
-  const resumeStoppedHls = useCallback(() => {
+  const resumeStoppedHls = useCallback((restartAtEnd = false) => {
     if (!hlsStopped.current) return
     hlsStopped.current = false
     const el = videoRef.current ?? audioRef.current
-    if (el) hlsMedia.current?.engine?.startLoad(el.currentTime)
+    if (!el) return
+    // Play at the stopped position is a replay: hls.js would ask for the past_end segment again.
+    if (restartAtEnd && Math.abs(el.currentTime - pastEndAt.current) <= 0.5) el.currentTime = 0
+    hlsMedia.current?.engine?.startLoad(el.currentTime)
   }, [])
   useEffect(() => {
     hlsStopped.current = false
@@ -308,7 +315,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
   const mediaEvents = {
     onPlay: () => {
       resumePlay.current = true
-      resumeStoppedHls()
+      resumeStoppedHls(true)
     },
     // Autoplay has to stay on the element until it actually starts. Clearing it on metadata
     // re-renders without the autoplay attribute before the browser begins playback.
@@ -567,7 +574,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
                 // playlist like the one this server returns, so it never loads a segment. The
                 // hls.js adapter parses that playlist directly; the video stays hidden because the
                 // audio skin draws the UI and the element only has to produce sound.
-                <HlsJsVideo key={mediaKey} ref={onVideo} mediaRef={onHlsMedia} source={{ src, engine: hlsEngine }} autoPlay={autoPlay} className="hidden" {...mediaEvents} />
+                <HlsJsVideo key={mediaKey} ref={onVideo} mediaRef={onHlsMedia} source={{ src, engine: hlsEngine }} playsInline autoPlay={autoPlay} className="hidden" {...mediaEvents} />
               ) : (
                 <Audio key={mediaKey} ref={audioRef} src={src} autoPlay={autoPlay} preload="metadata" {...mediaEvents} />
               )}
