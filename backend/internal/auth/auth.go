@@ -2,6 +2,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"database/sql"
@@ -67,12 +68,33 @@ const kdfConcurrency = 1
 
 var kdfSlots = make(chan struct{}, kdfConcurrency)
 
-// runKDF runs one password KDF inside the admission limit. The deferred release returns the slot
-// on every exit path, including a panic from the KDF.
-func runKDF(fn func()) {
-	kdfSlots <- struct{}{}
+// runKDFContext runs one password KDF inside the admission limit, waiting for a slot with ctx so a
+// client that disconnects stops waiting. before runs once a slot is held and before the KDF, so a
+// queued login can still be rejected without spending the hash. The deferred release returns the
+// slot on every exit path, including a panic from the KDF.
+func runKDFContext(ctx context.Context, before func() error, fn func()) error {
+	select {
+	case kdfSlots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	defer func() { <-kdfSlots }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if before != nil {
+		if err := before(); err != nil {
+			return err
+		}
+	}
 	fn()
+	return nil
+}
+
+// runKDF is the no-cancellation wrapper for callers without a request context. The deferred release
+// returns the slot on every exit path, including a panic from the KDF.
+func runKDF(fn func()) {
+	_ = runKDFContext(context.Background(), nil, fn)
 }
 
 var (
@@ -93,33 +115,55 @@ func HashPassword(pw string) (string, error) {
 		base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(h)), nil
 }
 
+// passwordKDF applies the hash policy and returns the KDF body to run inside an admission slot.
+// Policy rejection happens here, before any slot is taken, so a hostile or damaged row cannot make
+// a login wait behind an unrelated hash. ok is false when this build refuses the hash.
+func passwordKDF(encoded, pw string) (body func() bool, ok bool) {
+	if len(encoded) > maxPasswordHashLen {
+		return nil, false
+	}
+	if cost, err := bcrypt.Cost([]byte(encoded)); err == nil {
+		if cost > maxBcryptCost {
+			return nil, false
+		}
+		return func() bool { return bcrypt.CompareHashAndPassword([]byte(encoded), []byte(pw)) == nil }, true
+	}
+	p, ok := parseArgon2PHC(encoded)
+	if !ok {
+		return nil, false
+	}
+	return func() bool {
+		got := argon2.IDKey([]byte(pw), p.salt, p.time, p.memory, p.threads, uint32(len(p.key)))
+		return subtle.ConstantTimeCompare(got, p.key) == 1
+	}, true
+}
+
 // VerifyPassword checks pw against an encoded hash in constant time. A bcrypt hash is accepted so
 // an instance restored from a backup written by an older build can still log in; the next password
 // change rehashes it with argon2id. Bcrypt cost 15..31 and argon2 hashes outside the policy bounds
 // are rejected before any KDF runs, so a hostile or damaged row cannot exhaust memory, hang a
 // request, or panic the process.
 func VerifyPassword(encoded, pw string) bool {
-	if len(encoded) > maxPasswordHashLen {
-		return false
-	}
-	if cost, err := bcrypt.Cost([]byte(encoded)); err == nil {
-		if cost > maxBcryptCost {
-			return false
-		}
-		ok := false
-		runKDF(func() { ok = bcrypt.CompareHashAndPassword([]byte(encoded), []byte(pw)) == nil })
-		return ok
-	}
-	p, ok := parseArgon2PHC(encoded)
+	body, ok := passwordKDF(encoded, pw)
 	if !ok {
 		return false
 	}
-	ok = false
-	runKDF(func() {
-		got := argon2.IDKey([]byte(pw), p.salt, p.time, p.memory, p.threads, uint32(len(p.key)))
-		ok = subtle.ConstantTimeCompare(got, p.key) == 1
-	})
-	return ok
+	var passed bool
+	runKDF(func() { passed = body() })
+	return passed
+}
+
+// verifyPasswordContext is VerifyPassword with context-aware admission and a callback that runs
+// once a slot is held, before the KDF. It returns ctx.Err() when the wait or the attempt is
+// cancelled, and the policy rejection path still takes no slot.
+func verifyPasswordContext(ctx context.Context, encoded, pw string, before func() error) (bool, error) {
+	body, ok := passwordKDF(encoded, pw)
+	if !ok {
+		return false, nil
+	}
+	var passed bool
+	err := runKDFContext(ctx, before, func() { passed = body() })
+	return passed, err
 }
 
 // ValidatePasswordHash reports whether encoded is a hash this build can verify. Backup restore
@@ -262,9 +306,10 @@ type Service struct {
 	credMu  sync.Mutex
 	credRev uint64
 
-	// verifyPassword and hashPassword are the KDF boundaries. Tests replace them to hold a KDF
-	// open and prove that no credential lock is held while it runs; production uses the package
-	// functions.
+	// verifyPassword, when set, replaces the whole stored-password check and owns its own KDF
+	// admission, so a test can hold a verification open and prove that no credential lock is held
+	// while the KDF runs. Production leaves it nil; Login then uses the context-aware verifier.
+	// hashPassword is where a new hash is written and is likewise replaced by tests.
 	verifyPassword func(encoded, pw string) bool
 	hashPassword   func(pw string) (string, error)
 
@@ -274,7 +319,7 @@ type Service struct {
 // New ensures the admin row exists (admin/1234 on first run).
 func New(db *sql.DB) (*Service, error) {
 	s := &Service{db: db, now: time.Now, sessions: map[string]time.Time{}, lastSeen: map[string]time.Time{},
-		verifyPassword: VerifyPassword, hashPassword: HashPassword, limiter: NewLimiter(5, 15*time.Minute)}
+		hashPassword: HashPassword, limiter: NewLimiter(5, 15*time.Minute)}
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM admin`).Scan(&n); err != nil {
 		return nil, err
@@ -301,8 +346,31 @@ func (s *Service) Admin() (Admin, error) {
 	return a, err
 }
 
-// Login checks credentials and returns a new session token.
+// verifyStoredPassword runs the stored-password check for a caller. The test seam, when set,
+// replaces the whole check; production uses the context-aware verifier and its admission recheck.
+func (s *Service) verifyStoredPassword(ctx context.Context, encoded, pw string, before func() error) (bool, error) {
+	if s.verifyPassword != nil {
+		return s.verifyPassword(encoded, pw), nil
+	}
+	return verifyPasswordContext(ctx, encoded, pw, before)
+}
+
+// Login checks credentials and returns a new session token. It is the Background wrapper for
+// callers that have no request context.
 func (s *Service) Login(username, password, ip, ua string) (string, error) {
+	return s.LoginContext(context.Background(), username, password, ip, ua)
+}
+
+// LoginContext checks credentials and returns a new session token. It stops waiting for a KDF slot
+// when ctx is done, and it rechecks the IP lock once a slot is held and again atomically with
+// clearing the failure record before it writes a session. A request that queued before five
+// failures locked the IP therefore cannot mint a session after the lock. A performed password check
+// that failed is counted even when ctx was canceled during it, so a client cannot keep resetting
+// its failure accounting by disconnecting after sending a wrong password.
+func (s *Service) LoginContext(ctx context.Context, username, password, ip, ua string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if s.limiter.Locked(ip) {
 		return "", ErrLocked
 	}
@@ -311,21 +379,49 @@ func (s *Service) Login(username, password, ip, ua string) (string, error) {
 		return "", err
 	}
 	okName := subtle.ConstantTimeCompare([]byte(snap.username), []byte(username)) == 1
-	okPass := s.verifyPassword(snap.hash, password) // always run to keep timing uniform
+	before := func() error {
+		if s.limiter.Locked(ip) {
+			return ErrLocked
+		}
+		return nil
+	}
+	okPass, err := s.verifyStoredPassword(ctx, snap.hash, password, before) // always run to keep timing uniform
+	if err != nil {
+		return "", err
+	}
 	if !okName || !okPass {
-		if s.limiter.Fail(ip) {
+		// Record the failure before consulting ctx: the check already ran and failed, and a
+		// cancellation must not erase the attempt from the lockout accounting. It still must
+		// not mint a session or reveal more than the context error.
+		locked := s.limiter.Fail(ip)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if locked {
 			return "", ErrLocked
 		}
 		return "", ErrInvalidCredentials
 	}
+	if err := ctx.Err(); err != nil {
+		// A correct password does not count as a failure, and a canceled request still must
+		// not create a session; leave the credential gate untouched.
+		return "", err
+	}
 	s.credMu.Lock()
 	defer s.credMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if !s.credentialsUnchanged(snap) {
 		// The credential this login verified was replaced while the KDF ran. Its password may
 		// already be revoked, so do not mint a session that the revoke could not see.
 		return "", ErrInvalidCredentials
 	}
-	s.limiter.Reset(ip)
+	if !s.limiter.AllowSuccess(ip) {
+		// The KDF ran before the IP locked, but a queued login must not mint a session after it
+		// did, and the check and the failure-record clear cannot straddle a concurrent failure.
+		return "", ErrLocked
+	}
 	return s.createSession(ip, ua)
 }
 
@@ -450,7 +546,11 @@ func (s *Service) UpdateProfile(currentToken, currentPassword, newUsername, newP
 	if err != nil {
 		return "", err
 	}
-	if !s.verifyPassword(snap.hash, currentPassword) {
+	ok, err := s.verifyStoredPassword(context.Background(), snap.hash, currentPassword, nil)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
 		return "", errors.New("현재 비밀번호가 올바르지 않습니다")
 	}
 	var newHash string
@@ -620,6 +720,20 @@ func (l *Limiter) Fail(ip string) bool {
 		return true
 	}
 	return false
+}
+
+// AllowSuccess reports whether a successful login may proceed for ip and, when it may, clears the
+// failure record. The check and the clear hold the limiter lock together, so a failure that lands
+// concurrently cannot be erased by a login that already saw the IP unlocked.
+func (l *Limiter) AllowSuccess(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	a := l.m[ip]
+	if a != nil && l.now().Before(a.lockedUntil) {
+		return false
+	}
+	delete(l.m, ip)
+	return true
 }
 
 // Reset clears an ip.
