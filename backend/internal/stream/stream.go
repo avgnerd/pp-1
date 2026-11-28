@@ -413,7 +413,9 @@ func (r *ReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		n += c
 		off += int64(c)
 		if err != nil {
-			if n == len(p) {
+			// A full destination does not make a block error harmless. Only the block ending at
+			// EOF is a complete read; a framing failure must reach the caller even at len(p).
+			if n == len(p) && errors.Is(err, io.EOF) {
 				return n, nil
 			}
 			return n, err
