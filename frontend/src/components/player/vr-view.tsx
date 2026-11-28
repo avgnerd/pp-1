@@ -26,14 +26,26 @@ export function VRView({ video, projection, stereo }: Props) {
 
     import("three").then((THREE) => {
       if (disposed) return
+      let renderer: InstanceType<typeof THREE.WebGLRenderer>
+      try {
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" })
+      } catch {
+        // WebGL is disabled or unavailable (blocked GPU, headless browser, context limit).
+        setError("이 브라우저에서 WebGL을 사용할 수 없어 VR로 표시할 수 없습니다. VR을 끄고 일반 화면으로 보세요.")
+        return
+      }
       setError(null)
-      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" })
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
       renderer.outputColorSpace = THREE.SRGBColorSpace
       host.appendChild(renderer.domElement)
       renderer.domElement.style.display = "block"
       renderer.domElement.style.width = "100%"
       renderer.domElement.style.height = "100%"
+      // Video.js gestures skip [data-interactive] targets, so a quick look-around drag never
+      // reads as a tap (play/pause) or double tap (seek, fullscreen). touch-action keeps a
+      // touch pan from scrolling the page.
+      renderer.domElement.dataset.interactive = ""
+      renderer.domElement.style.touchAction = "none"
       renderer.domElement.tabIndex = 0
       renderer.domElement.setAttribute("aria-label", "VR 영상: 드래그하거나 방향키로 둘러보고, 휠로 확대·축소")
 
@@ -130,10 +142,15 @@ export function VRView({ video, projection, stereo }: Props) {
         camera.updateProjectionMatrix()
         dirty = true
       }
+      // Pointer events still bubble so the player shows its controls on activity; clicks end
+      // here because a click on the scene only ever means "look around".
+      const onClick = (e: MouseEvent) => e.stopPropagation()
       el.addEventListener("pointerdown", onDown)
       el.addEventListener("pointermove", onMove)
       el.addEventListener("pointerup", onUp)
       el.addEventListener("pointercancel", onUp)
+      el.addEventListener("click", onClick)
+      el.addEventListener("dblclick", onClick)
       el.addEventListener("wheel", onWheel, { passive: false })
       el.addEventListener("keydown", onKey)
 
@@ -166,6 +183,8 @@ export function VRView({ video, projection, stereo }: Props) {
         el.removeEventListener("pointermove", onMove)
         el.removeEventListener("pointerup", onUp)
         el.removeEventListener("pointercancel", onUp)
+        el.removeEventListener("click", onClick)
+        el.removeEventListener("dblclick", onClick)
         el.removeEventListener("wheel", onWheel)
         el.removeEventListener("keydown", onKey)
         texture.dispose()
@@ -174,6 +193,9 @@ export function VRView({ video, projection, stereo }: Props) {
         renderer.dispose()
         el.remove()
       }
+    }).catch(() => {
+      // The three.js chunk failed to download (offline, or a deploy replaced it).
+      if (!disposed) setError("VR 렌더러를 불러오지 못했습니다. 네트워크를 확인한 뒤 페이지를 새로고침하세요.")
     })
     return () => {
       disposed = true
@@ -182,8 +204,12 @@ export function VRView({ video, projection, stereo }: Props) {
   }, [video, projection, stereo])
 
   return (
-    <div ref={hostRef} className="absolute inset-0 z-[1] bg-black" data-vr={projection}>
-      {error ? <p className="absolute inset-x-4 top-4 rounded-md bg-black/70 p-3 text-sm text-white">{error}</p> : null}
+    <div ref={hostRef} className="absolute inset-0 z-[1] touch-none bg-black" data-vr={projection} data-interactive>
+      {error ? (
+        <p role="alert" className="absolute inset-x-4 top-4 rounded-md bg-black/70 p-3 text-sm text-white">
+          {error}
+        </p>
+      ) : null}
     </div>
   )
 }
