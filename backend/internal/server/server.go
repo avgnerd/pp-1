@@ -63,6 +63,11 @@ type Server struct {
 	// lock long enough to observe a concurrent apply.
 	restoreHook func()
 
+	// settingsPutMu serializes the settings read-modify-write end to end, so two admin PUTs cannot
+	// overwrite each other's fields. The settings store's restore gate refuses a write that
+	// straddles a restore.
+	settingsPutMu sync.Mutex
+
 	zipMu     sync.Mutex
 	zipTokens map[string]zipJob
 
@@ -149,6 +154,7 @@ func (s *Server) housekeeping() {
 			return
 		case <-t.C:
 			s.Auth.PurgeExpired()
+			s.Backups.Previews.Purge()
 			_, _ = s.DB.Exec(`DELETE FROM oauth_states WHERE expires_at < ?`, time.Now().Unix())
 			s.zipMu.Lock()
 			for k, j := range s.zipTokens {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"time"
 
@@ -127,6 +128,11 @@ func (s *Server) restoreApply(c *gin.Context) {
 	// conflict instead of writing a row the restore is replacing.
 	s.St.BeginRestore()
 	defer s.St.EndRestore()
+	// Hold the settings gate across the preview take, the transaction and the runtime refresh. An
+	// in-flight settings write finishes before this line; a write that starts afterwards fails
+	// with ErrRestoreInProgress instead of storing pre-restore values after the commit.
+	s.Settings.BeginRestore()
+	defer s.Settings.EndRestore()
 	if s.restoreHook != nil {
 		s.restoreHook()
 	}
@@ -151,6 +157,10 @@ func (s *Server) restoreApply(c *gin.Context) {
 		writeBackupError(c, err)
 		return
 	}
+	// The applied preview was consumed by TakePreview. Every other preview belongs to a session
+	// the restored database just dropped, so clear the remaining plaintext payloads now. A failed
+	// apply keeps them: its sessions are not revoked yet, and the admin may retry with one.
+	s.Backups.Previews.Clear()
 	// The storage rows are the restored ones now. Invalidate pre-restore clients before the rest
 	// of the refresh, so a callback from one of them cannot write over a restored row even if a
 	// later refresh step fails.
@@ -259,6 +269,9 @@ func readBackupUpload(c *gin.Context) ([]byte, string, error) {
 }
 
 func readMultipartBackup(c *gin.Context) ([]byte, string, error) {
+	// Cap the whole body before the multipart reader touches it. Without this, skipping or closing
+	// a part can drain an upload far past the 10 MiB file limit.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBackupBytes+maxJSONWrapperBytes)
 	mr, err := c.Request.MultipartReader()
 	if err != nil {
 		return nil, "", toLargeOrBad(err)
@@ -271,30 +284,30 @@ func readMultipartBackup(c *gin.Context) ([]byte, string, error) {
 			break
 		}
 		if err != nil {
-			return nil, "", errBodyUnreadable
+			return nil, "", multipartReadError(err)
 		}
 		switch part.FormName() {
 		case "file":
-			if data != nil {
-				_, _ = io.Copy(io.Discard, io.LimitReader(part, maxBackupBytes+1))
-				part.Close()
-				continue
-			}
-			buf, err := io.ReadAll(io.LimitReader(part, maxBackupBytes+1))
-			part.Close()
+			buf, over, err := readLimitedPart(part, maxBackupBytes)
 			if err != nil {
-				return nil, "", errBodyUnreadable
+				return nil, "", err
 			}
-			if int64(len(buf)) > maxBackupBytes {
+			if over {
+				// Do not call part.Close() here: Close copies the rest of the part to EOF and
+				// would read the entire oversized upload despite the file limit.
 				return nil, "", errTooLarge
 			}
-			data = buf
+			part.Close()
+			// A second file part is ignored; the first one is the upload.
+			if data == nil {
+				data = buf
+			}
 		case "password":
 			buf, err := io.ReadAll(io.LimitReader(part, 4096))
-			part.Close()
 			if err != nil {
-				return nil, "", errBodyUnreadable
+				return nil, "", multipartReadError(err)
 			}
+			part.Close()
 			password = string(buf)
 		default:
 			_, _ = io.Copy(io.Discard, io.LimitReader(part, 1<<20))
@@ -305,6 +318,29 @@ func readMultipartBackup(c *gin.Context) ([]byte, string, error) {
 		return nil, "", &apiError{status: http.StatusBadRequest, msg: "백업 파일을 선택하세요", field: "file"}
 	}
 	return data, password, nil
+}
+
+// readLimitedPart reads at most limit+1 bytes from one multipart part. over reports that the part
+// carries more than limit. On over it deliberately leaves the part open: the caller must not close
+// it, because Close drains the remainder to EOF.
+func readLimitedPart(part *multipart.Part, limit int64) (buf []byte, over bool, err error) {
+	buf, err = io.ReadAll(io.LimitReader(part, limit+1))
+	if err != nil {
+		return nil, false, multipartReadError(err)
+	}
+	if int64(len(buf)) > limit {
+		return nil, true, nil
+	}
+	return buf, false, nil
+}
+
+// multipartReadError maps the body-level cap to the same 413 the file-level limit produces.
+func multipartReadError(err error) error {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return errTooLarge
+	}
+	return errBodyUnreadable
 }
 
 func readJSONBackup(c *gin.Context) ([]byte, string, error) {
@@ -355,6 +391,10 @@ var (
 
 // toLargeOrBad maps a multipart reader setup failure to a client error.
 func toLargeOrBad(err error) error {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return errTooLarge
+	}
 	if err == http.ErrNotMultipart || err == http.ErrMissingBoundary {
 		return &apiError{status: http.StatusBadRequest, msg: "업로드 형식이 올바르지 않습니다", field: "file"}
 	}

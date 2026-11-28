@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/dvfs/dropbox-vfs-manager/internal/auth"
+	"github.com/dvfs/dropbox-vfs-manager/internal/settings"
 	"github.com/dvfs/dropbox-vfs-manager/internal/storage"
 )
 
@@ -24,7 +25,7 @@ func (s *Server) login(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	tok, err := s.Auth.Login(in.Username, in.Password, c.ClientIP(), c.Request.UserAgent())
+	tok, err := s.Auth.LoginContext(c.Request.Context(), in.Username, in.Password, c.ClientIP(), c.Request.UserAgent())
 	if err != nil {
 		status := http.StatusUnauthorized
 		if errors.Is(err, auth.ErrLocked) {
@@ -39,6 +40,9 @@ func (s *Server) login(c *gin.Context) {
 
 func (s *Server) logout(c *gin.Context) {
 	tok, _ := c.Cookie(auth.CookieName)
+	// A preview holds a decrypted backup, and its id is bound to this login session. Drop it with
+	// the session so the plaintext does not outlive the cookie that could apply it.
+	s.Backups.Previews.DropSession(tok)
 	s.Auth.Logout(tok)
 	s.setSessionCookie(c, "", -1)
 	c.JSON(200, gin.H{"ok": true})
@@ -97,12 +101,24 @@ func (s *Server) putProfile(c *gin.Context) {
 func (s *Server) getSettings(c *gin.Context) { c.JSON(200, s.Settings.Get()) }
 
 func (s *Server) putSettings(c *gin.Context) {
+	// Serialize the read-modify-write end to end: without this, two admins editing different
+	// fields can each merge onto the same snapshot and the later write silently drops the other.
+	s.settingsPutMu.Lock()
+	defer s.settingsPutMu.Unlock()
+	// Capture the restore revision before reading: if a restore starts or finishes while this
+	// request is in flight, UpdateAtRevision rejects the pre-restore snapshot instead of writing
+	// it after the restore commit.
+	rev := s.Settings.RestoreVersion()
 	n := s.Settings.Get()
 	if err := bindJSON(c, &n); err != nil {
 		fail(c, err)
 		return
 	}
-	if err := s.Settings.Update(n); err != nil {
+	if err := s.Settings.UpdateAtRevision(rev, n); err != nil {
+		if errors.Is(err, settings.ErrRestoreInProgress) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "restore_in_progress"})
+			return
+		}
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
