@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -200,6 +201,10 @@ func (s *Server) thumb(c *gin.Context) {
 // TextLimit is the maximum bytes returned for a text preview.
 const TextLimit = 1 << 20
 
+// pdfPreviewMagic identifies a PDF preview by its bytes. Dropbox labels both PDF and HTML
+// previews application/octet-stream, so the upstream Content-Type cannot be trusted.
+const pdfPreviewMagic = "%PDF-"
+
 func decodeText(b []byte) (string, string) {
 	switch {
 	case bytes.HasPrefix(b, []byte{0xEF, 0xBB, 0xBF}):
@@ -278,17 +283,19 @@ func (s *Server) officePreview(c *gin.Context) {
 		return
 	}
 	defer resp.Body.Close()
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
+	// Peek without consuming: the buffered reader handed to DataFromReader still streams the
+	// peeked bytes and the rest of the preview.
+	br := bufio.NewReader(resp.Body)
+	ct := "text/html; charset=utf-8"
+	if head, _ := br.Peek(len(pdfPreviewMagic)); bytes.HasPrefix(head, []byte(pdfPreviewMagic)) {
 		ct = "application/pdf"
-	}
-	c.Header("Cache-Control", "private, max-age=600")
-	c.Header("Content-Disposition", "inline")
-	if strings.HasPrefix(ct, "text/html") {
+	} else {
 		// Spreadsheet previews are Dropbox-generated HTML; render it without scripts.
 		c.Header("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:")
 	}
-	c.DataFromReader(200, resp.ContentLength, ct, resp.Body, nil)
+	c.Header("Cache-Control", "private, max-age=600")
+	c.Header("Content-Disposition", "inline")
+	c.DataFromReader(200, resp.ContentLength, ct, br, nil)
 }
 
 // archiveLoadTimeout bounds an archive read that outlives its callers, the same two minutes this
