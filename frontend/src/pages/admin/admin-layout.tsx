@@ -25,10 +25,20 @@ export default function AdminLayout() {
   return (
     <div className="flex min-h-svh flex-col md:flex-row">
       <aside className="flex shrink-0 flex-col gap-1 border-b bg-sidebar p-3 md:sticky md:top-0 md:h-svh md:w-56 md:border-r md:border-b-0">
-        <Link to="/" className="mb-3 flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:text-foreground">
-          <ArrowLeftIcon className="size-4" aria-hidden />
-          사이트로 돌아가기
-        </Link>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <Link to="/" className="flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:text-foreground">
+            <ArrowLeftIcon className="size-4" aria-hidden />
+            사이트로 돌아가기
+          </Link>
+          {/* Below md the sidebar footer is hidden, so the top bar carries the account controls. */}
+          <div className="flex min-w-0 items-center gap-1 md:hidden">
+            <p className="truncate text-xs text-muted-foreground">{me.data?.username}</p>
+            <Button variant="ghost" size="sm" onClick={logout}>
+              <LogOutIcon data-icon="inline-start" />
+              로그아웃
+            </Button>
+          </div>
+        </div>
         <p className="px-2 pb-1 text-sm font-semibold">관리</p>
         <nav aria-label="관리 메뉴" className="flex gap-1 md:flex-col">
           {navItems.map(({ to, label, icon: Icon }) => (
