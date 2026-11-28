@@ -404,17 +404,36 @@ test("file changes invalidate stat, siblings and picker caches case-insensitivel
 })
 
 test("deleting a storage invalidates mount-scoped caches", async ({ page }) => {
-  await page.goto(server.origin + "/admin/storages")
+  await page.goto(server.origin + "/synthetic")
+  const folder = page.getByRole("link", { name: "normal", exact: true })
+  await folder.click({ button: "right" })
+  await page.getByRole("menuitem", { name: "폴더 크기", exact: true }).click()
+  await expect
+    .poll(() =>
+      server.sizeStreams.some(
+        (s: { path: string; closed: boolean }) =>
+          s.path === "/synthetic/normal" && !s.closed
+      )
+    )
+    .toBe(true)
+
+  await page.evaluate(async () => {
+    const modulePath = "/src/router.tsx"
+    const { router } = await import(modulePath)
+    await router.navigate({ to: "/admin/storages" })
+  })
   await expect(page.getByText("1개 저장소", { exact: true })).toBeVisible()
   const cachedKeys = [
     ["list", "/synthetic"],
     ["stat", "/synthetic"],
     ["siblings", "/synthetic", "name", "asc"],
     ["picker", "/synthetic"],
+    ["archive", "/synthetic"],
   ]
   await page.evaluate(async (keys) => {
     const { queryClient } = await import("/src/lib/queries.ts")
     for (const key of keys) queryClient.setQueryData(key, [])
+    queryClient.setQueryData(["fsize", "/synthetic"], { status: "done" })
   }, cachedKeys)
   await page.getByRole("button", { name: "/synthetic 삭제" }).click()
   await page
@@ -429,11 +448,28 @@ test("deleting a storage invalidates mount-scoped caches", async ({ page }) => {
   ).toBeVisible()
   const states = await page.evaluate(async (keys) => {
     const { queryClient } = await import("/src/lib/queries.ts")
-    return keys.map(
-      (key) => queryClient.getQueryState(key)?.isInvalidated ?? null
-    )
+    return {
+      invalidated: keys.map(
+        (key) => queryClient.getQueryState(key)?.isInvalidated ?? null
+      ),
+      folderSizeGone:
+        queryClient.getQueryState(["fsize", "/synthetic"]) === undefined,
+      runningFolderSizeGone:
+        queryClient.getQueryState(["fsize", "/synthetic/normal"]) === undefined,
+    }
   }, cachedKeys)
-  expect(states).toEqual([true, true, true, true])
+  expect(states.invalidated).toEqual([true, true, true, true, true])
+  expect(states.folderSizeGone).toBe(true)
+  expect(states.runningFolderSizeGone).toBe(true)
+  // A running total describes the state before the mount went away, so the stream must stop.
+  await expect
+    .poll(() =>
+      server.sizeStreams.some(
+        (s: { path: string; closed: boolean }) =>
+          s.path === "/synthetic/normal" && s.closed
+      )
+    )
+    .toBe(true)
 })
 
 test("dotfiles and unicode names keep their in-app preview route", async ({
@@ -986,4 +1022,110 @@ test("a restore 401 dispatches the unauthorized event", async ({ page }) => {
     return fired
   })
   expect(fired).toBe(true)
+})
+
+test("clearing the cache closes folder size streams and drops path caches", async ({
+  page,
+}) => {
+  await stubAdminSettings(page)
+  await page.route("**/api/admin/cache/clear", (route) =>
+    route.fulfill({ json: { ok: true } })
+  )
+  await page.goto(server.origin + "/synthetic")
+  const folder = page.getByRole("link", { name: "normal", exact: true })
+  await folder.click({ button: "right" })
+  await page.getByRole("menuitem", { name: "폴더 크기", exact: true }).click()
+  await expect
+    .poll(() =>
+      server.sizeStreams.some(
+        (s: { path: string; closed: boolean }) =>
+          s.path === "/synthetic/normal" && !s.closed
+      )
+    )
+    .toBe(true)
+  await page.evaluate(async () => {
+    const { queryClient } = await import("/src/lib/queries.ts")
+    const cached = {
+      fsize: ["fsize", "/synthetic"],
+      stat: ["stat", "/synthetic"],
+      siblings: ["siblings", "/synthetic", "name", "asc"],
+      archive: ["archive", "/synthetic"],
+    }
+    for (const key of Object.values(cached)) queryClient.setQueryData(key, [])
+  })
+  await openAdminSettings(page)
+  await page.getByRole("tab", { name: "시스템", exact: true }).click()
+  await page.getByRole("button", { name: "캐시 비우기", exact: true }).click()
+  await expect(
+    page.getByText("캐시를 비웠습니다", { exact: true })
+  ).toBeVisible()
+  // A running total describes the state before the server cache was wiped.
+  await expect
+    .poll(() =>
+      server.sizeStreams.some(
+        (s: { path: string; closed: boolean }) =>
+          s.path === "/synthetic/normal" && s.closed
+      )
+    )
+    .toBe(true)
+  await expect
+    .poll(async () =>
+      page.evaluate(async () => {
+        const { queryClient } = await import("/src/lib/queries.ts")
+        const invalidated = (key: unknown[]) =>
+          queryClient.getQueryState(key)?.isInvalidated ?? false
+        return {
+          fsize:
+            queryClient.getQueryState(["fsize", "/synthetic"]) === undefined,
+          runningFolderSize:
+            queryClient.getQueryState(["fsize", "/synthetic/normal"]) ===
+            undefined,
+          stat: invalidated(["stat", "/synthetic"]),
+          siblings: invalidated(["siblings", "/synthetic", "name", "asc"]),
+          archive: invalidated(["archive", "/synthetic"]),
+        }
+      })
+    )
+    .toEqual({
+      fsize: true,
+      runningFolderSize: true,
+      stat: true,
+      siblings: true,
+      archive: true,
+    })
+})
+
+test("a failed cache clear shows an error toast", async ({ page }) => {
+  await stubAdminSettings(page)
+  await page.route("**/api/admin/cache/clear", (route) =>
+    route.fulfill({
+      status: 500,
+      json: { error: "캐시를 비울 수 없습니다" },
+    })
+  )
+  await page.goto(server.origin + "/synthetic")
+  await page.evaluate(() => {
+    const scope = window as Window & { __cacheRejections?: unknown[] }
+    scope.__cacheRejections = []
+    window.addEventListener("unhandledrejection", (event) => {
+      scope.__cacheRejections?.push((event as PromiseRejectionEvent).reason)
+    })
+  })
+  await openAdminSettings(page)
+  await page.getByRole("tab", { name: "시스템", exact: true }).click()
+  await page.getByRole("button", { name: "캐시 비우기", exact: true }).click()
+  await expect(
+    page.getByText("캐시를 비우지 못했습니다", { exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByText("캐시를 비울 수 없습니다", { exact: true })
+  ).toBeVisible()
+  // The failure is reported by the toast, not by an unhandled rejection reaching the page.
+  const rejections = await page.evaluate(
+    () =>
+      (
+        window as Window & { __cacheRejections?: unknown[] }
+      ).__cacheRejections ?? []
+  )
+  expect(rejections).toEqual([])
 })

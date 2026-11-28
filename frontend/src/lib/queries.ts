@@ -46,6 +46,12 @@ export function useSearchRevision() {
 
 const running = new Map<string, () => void>()
 
+/** Stop every running folder-size stream. Their progress describes the state before a cache wipe. */
+export function stopAllFolderSizeStreams() {
+  for (const close of running.values()) close()
+  running.clear()
+}
+
 /**
  * After a rename/move/copy/delete: refetch the affected folder listings and forget
  * on-demand folder sizes of every ancestor and descendant of the changed paths.
