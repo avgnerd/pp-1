@@ -235,7 +235,12 @@ func (c *Config) PublicCallback() string {
 // SecureCookies reports whether the configured public URL already proves the deployment is served
 // over TLS.
 func (c *Config) SecureCookies() bool {
-	return strings.HasPrefix(c.PublicURL, "https://")
+	u, err := url.Parse(c.PublicURL)
+	if err != nil {
+		return false
+	}
+	// url.Parse normalizes the scheme's case; EqualFold also keeps a hand-built Config honest.
+	return strings.EqualFold(u.Scheme, "https")
 }
 
 // SecureRequest reports whether the session cookie for r must carry the Secure flag. A configured
