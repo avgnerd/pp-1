@@ -27,6 +27,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv("HLS_INIT_RESTART_HELPER") == "1" {
 		os.Exit(hlsInitRestartHelper())
 	}
+	if os.Getenv(wave2Helper) == "1" {
+		os.Exit(hlsWave2Helper())
+	}
 	os.Exit(m.Run())
 }
 

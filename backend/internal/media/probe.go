@@ -55,8 +55,10 @@ type Probe struct {
 	V        int      `json:"v,omitempty"` // probeVersion that produced this result
 }
 
-// probeVersion is bumped when Probe gains fields older cached results lack (2: stream end).
-const probeVersion = 2
+// probeVersion is bumped when Probe gains fields older cached results lack or when parsing
+// changes what an existing field means. 2 added stream end. 3 invalidates results where a
+// format-level spherical tag let the parser overwrite stream sbs/tb metadata with mono.
+const probeVersion = 3
 
 type ffprobeOut struct {
 	Streams []struct {
@@ -105,7 +107,7 @@ func (p *Prober) Available() bool { return p.FFprobe != "" }
 
 // Probe returns cached info or runs ffprobe against url.
 func (p *Prober) Probe(ctx context.Context, fileID, rev, name, url string) (*Probe, error) {
-	if pr, ok := p.cachedProbe(ctx, fileID, rev); ok {
+	if pr, ok := p.cachedProbe(ctx, fileID, rev, name); ok {
 		return pr, nil
 	}
 	if !p.Available() {
@@ -122,7 +124,7 @@ func (p *Prober) Probe(ctx context.Context, fileID, rev, name, url string) (*Pro
 	ch := p.probes.DoChan(fileID+"\x00"+rev, func() (any, error) {
 		opCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 		defer cancel()
-		if pr, ok := p.cachedProbe(opCtx, fileID, rev); ok {
+		if pr, ok := p.cachedProbe(opCtx, fileID, rev, name); ok {
 			return pr, nil
 		}
 		return p.probeWithTimeout(opCtx, fileID, rev, name, url)
@@ -136,13 +138,15 @@ func (p *Prober) Probe(ctx context.Context, fileID, rev, name, url string) (*Pro
 		if !ok || pr == nil {
 			return nil, fmt.Errorf("ffprobe 공유 결과 형식 오류")
 		}
-		return pr, nil
+		// The first caller's name produced this result; every waiter reads it under its own
+		// current name so a shared probe cannot hand one caller another file's layout.
+		return probeForName(pr, name), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-func (p *Prober) cachedProbe(ctx context.Context, fileID, rev string) (*Probe, bool) {
+func (p *Prober) cachedProbe(ctx context.Context, fileID, rev, name string) (*Probe, bool) {
 	if fileID == "" || rev == "" {
 		return nil, false
 	}
@@ -154,7 +158,20 @@ func (p *Prober) cachedProbe(ctx context.Context, fileID, rev string) (*Probe, b
 	if json.Unmarshal([]byte(data), &pr) != nil || pr.V < probeVersion {
 		return nil, false
 	}
-	return &pr, true
+	return probeForName(&pr, name), true
+}
+
+// probeForName recomputes a filename-derived VR layout for the file's current name. A Dropbox
+// rename keeps the file id and rev, so the layout stored with the probe goes stale; metadata from
+// ffprobe describes the content and is never recomputed. The result is a copy, so a shared
+// singleflight value and the stored row are not mutated.
+func probeForName(pr *Probe, name string) *Probe {
+	if pr.VR.Source == "metadata" {
+		return pr
+	}
+	cp := *pr
+	cp.VR = DetectVRName(name)
+	return &cp
 }
 
 func (p *Prober) probeWithTimeout(ctx context.Context, fileID, rev, name, url string) (*Probe, error) {
@@ -223,10 +240,15 @@ func parseProbe(out []byte, name string) (*Probe, error) {
 			}
 		}
 	}
-	if meta.Projection == "" {
-		meta = vrFromTags(f.Format.Tags)
+	// Format tags only say the file is spherical; the stream side data is the only source for the
+	// stereo layout. Merge the projection and leave an sbs/tb pair alone.
+	if tagged := vrFromTags(f.Format.Tags); tagged.Projection != "" && meta.Projection == "" {
+		meta.Projection = tagged.Projection
 	}
 	if meta.Projection != "" {
+		if meta.Stereo == "" {
+			meta.Stereo = "mono"
+		}
 		meta.Source = "metadata"
 		pr.VR = meta
 	} else {
@@ -309,8 +331,8 @@ func vrFromTags(tags map[string]string) VRInfo {
 }
 
 var (
-	re180 = regexp.MustCompile(`(?i)(^|[^0-9a-z])(vr)?180([^0-9]|$)`)
-	re360 = regexp.MustCompile(`(?i)(^|[^0-9a-z])(vr)?360([^0-9]|$)`)
+	re180 = regexp.MustCompile(`(?i)(^|[^0-9a-z])(vr)?180([^0-9a-z]|$)`)
+	re360 = regexp.MustCompile(`(?i)(^|[^0-9a-z])(vr)?360([^0-9a-z]|$)`)
 	reSBS = regexp.MustCompile(`(?i)(^|[^a-z])(sbs|lr|3dh|side[-_ ]?by[-_ ]?side)([^a-z]|$)`)
 	reTB  = regexp.MustCompile(`(?i)(^|[^a-z])(tb|ou|tab|3dv|over[-_ ]?under|top[-_ ]?bottom)([^a-z]|$)`)
 )
