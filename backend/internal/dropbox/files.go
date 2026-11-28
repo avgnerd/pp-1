@@ -343,7 +343,7 @@ func (c *Client) reconcileMove(ctx context.Context, r Relocation, dst *Metadata,
 	if r.SourceID == "" {
 		return RelocationUnknown // no pre-move identity to compare the destination with
 	}
-	if dstFound && dst.ID == r.SourceID && (r.Name == "" || strings.EqualFold(dst.Name, r.Name)) {
+	if dstFound && dst.ID == r.SourceID && (r.Name == "" || dst.Name == r.Name) {
 		return RelocationApplied
 	}
 	src, err := c.GetMetadata(ctx, r.From)
@@ -411,25 +411,33 @@ func (c *Client) ReconcileDelete(ctx context.Context, path string) RelocationOut
 }
 
 func (c *Client) runBatch(ctx context.Context, launch, check string, arg any) ([]BatchFailure, bool, error) {
-	ctx, marker := withRetryMarker(ctx)
+	launchCtx, marker := withRetryMarker(ctx)
 	var l batchLaunch
-	if err := c.RPC(ctx, launch, arg, &l); err != nil {
-		return nil, marker.ambiguous.Load(), err
+	if err := c.RPC(launchCtx, launch, arg, &l); err != nil {
+		amb := marker.ambiguous.Load()
+		return nil, amb, ambiguousFailure(amb, err)
 	}
 	if l.Tag == "complete" {
 		return failures(l), marker.ambiguous.Load(), nil
 	}
 	if l.AsyncJobID == "" {
-		return nil, marker.ambiguous.Load(), fmt.Errorf("%s: unexpected response tag %q", launch, l.Tag)
+		amb := marker.ambiguous.Load()
+		return nil, amb, ambiguousFailure(amb, fmt.Errorf("%s: unexpected response tag %q", launch, l.Tag))
+	}
+	// The launch was accepted and the job is running. Any failure to observe it to completion
+	// leaves the batch outcome unknown, even when the check surfaced a definitive error. Polling
+	// is read-only, so its own retries must not mark the launch Retried.
+	pollFailed := func(err error) ([]BatchFailure, bool, error) {
+		return nil, true, ambiguousFailure(true, err)
 	}
 	wait := 300 * time.Millisecond
 	for {
 		if err := sleep(ctx, wait); err != nil {
-			return nil, marker.ambiguous.Load(), err
+			return pollFailed(err)
 		}
 		var st batchLaunch
 		if err := c.RPC(ctx, check, map[string]string{"async_job_id": l.AsyncJobID}, &st); err != nil {
-			return nil, marker.ambiguous.Load(), err
+			return pollFailed(err)
 		}
 		switch st.Tag {
 		case "in_progress":
@@ -440,7 +448,7 @@ func (c *Client) runBatch(ctx context.Context, launch, check string, arg any) ([
 		case "complete":
 			return failures(st), marker.ambiguous.Load(), nil
 		default:
-			return nil, marker.ambiguous.Load(), fmt.Errorf("%s: job ended with %q", check, st.Tag)
+			return pollFailed(fmt.Errorf("%s: job ended with %q", check, st.Tag))
 		}
 	}
 }

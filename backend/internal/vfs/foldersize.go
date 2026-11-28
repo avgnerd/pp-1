@@ -19,8 +19,10 @@ type SizeProgress struct {
 }
 
 // FolderSize computes the total size of a folder on demand using a recursive listing.
-// The result is cached for the storage's cache TTL. lim bounds concurrent calculations
-// across the server; progress is called after each page and while waiting in the queue.
+// The result is cached for the storage's cache TTL unless an explicit cache invalidation runs
+// while the scan is in flight; the result of that scan still returns to this caller.
+// lim bounds concurrent calculations across the server; progress is called after each page and
+// while waiting in the queue.
 func (s *Service) FolderSize(ctx context.Context, vpath string, lim *limiter.Limiter, progress func(SizeProgress)) (SizeProgress, error) {
 	t, err := s.Resolve(vpath)
 	if err != nil {
@@ -41,6 +43,10 @@ func (s *Service) FolderSize(ctx context.Context, vpath string, lim *limiter.Lim
 		}
 	}
 	defer lim.Release()
+	// Capture after admission and before the first listing: an invalidation that runs from here on
+	// makes this scan's result ineligible for the cache. An invalidation before this point is fine
+	// to cache because the scan reads the storage after it.
+	generation := s.Cache.InvalidationGeneration()
 	c, err := s.St.Client(t.Storage.ID)
 	if err != nil {
 		return SizeProgress{}, err
@@ -73,6 +79,6 @@ func (s *Service) FolderSize(ctx context.Context, vpath string, lim *limiter.Lim
 	if p.Folders > 0 && t.DbxPath != "/" {
 		p.Folders-- // the recursive listing includes the folder itself
 	}
-	s.Cache.Set(key, p, 40, t.Storage.CacheTTL())
+	s.Cache.SetIfCurrent(generation, key, p, 40, t.Storage.CacheTTL())
 	return p, nil
 }

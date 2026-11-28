@@ -58,6 +58,10 @@ type Server struct {
 	SearchPageSize int         // search page size; 0 returns every match in one page
 	Latency        time.Duration
 	FailAccounts   sync.Map // app key -> true: every RPC returns 500
+
+	// PreviewOctetStream makes files/get_preview answer application/octet-stream, as the real
+	// API does for both PDF and HTML previews, while still sending the extension's real body.
+	PreviewOctetStream bool
 }
 
 // New creates an empty fake.
@@ -405,12 +409,19 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		mb, _ := json.Marshal(acct.meta(key))
 		w.Header().Set("Dropbox-API-Result", string(mb))
 		if ep == "files/get_preview" {
-			if strings.HasSuffix(key, ".xlsx") || strings.HasSuffix(key, ".csv") {
-				w.Header().Set("Content-Type", "text/html")
+			htmlPreview := strings.HasSuffix(key, ".xlsx") || strings.HasSuffix(key, ".csv")
+			contentType := "application/pdf"
+			if htmlPreview {
+				contentType = "text/html"
+			}
+			if s.PreviewOctetStream {
+				contentType = "application/octet-stream"
+			}
+			w.Header().Set("Content-Type", contentType)
+			if htmlPreview {
 				fmt.Fprintf(w, "<table><tr><td>%s</td></tr></table>", n.Name)
 				return
 			}
-			w.Header().Set("Content-Type", "application/pdf")
 			w.Write([]byte("%PDF-1.4 fake"))
 			return
 		}

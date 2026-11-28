@@ -12,6 +12,11 @@ import (
 // requirements give the admin ten minutes to review a preview.
 var PreviewTTL = 10 * time.Minute
 
+// maxRetainedPreviews bounds how many decrypted backups the store keeps in memory. A preview holds
+// the full plaintext payload, so an admin who uploads repeatedly must not grow the process without
+// limit. 32 leaves generous room for normal retries while capping the retained memory.
+const maxRetainedPreviews = 32
+
 // ErrPreviewInvalid covers every reason a preview_id cannot be applied: unknown, already used,
 // expired, or bound to another login session. The cases are deliberately not distinguished so a
 // caller cannot probe for ids that exist.
@@ -51,7 +56,7 @@ type Preview struct {
 }
 
 // Summary renders the client-facing view of the preview. Secrets stay behind: only names, mount
-// paths and counts leave the server.
+// paths and counts leave the server. A nil payload yields an empty storage list, never a panic.
 func (p *Preview) Summary() *RestorePreview {
 	out := &RestorePreview{
 		PreviewID:      p.ID,
@@ -60,11 +65,12 @@ func (p *Preview) Summary() *RestorePreview {
 		EncryptionMode: p.EncryptionMode,
 		CreatedAt:      p.CreatedAt,
 		AppVersion:     p.AppVersion,
-		Storages:       make([]PreviewStorage, 0, len(p.Payload.Storages)),
+		Storages:       []PreviewStorage{},
 	}
 	if p.Payload != nil {
 		out.AdminUsername = p.Payload.Admin.Username
 		out.SettingsCount = len(p.Payload.Settings)
+		out.Storages = make([]PreviewStorage, 0, len(p.Payload.Storages))
 		for _, s := range p.Payload.Storages {
 			out.Storages = append(out.Storages, PreviewStorage{Name: s.Name, MountPath: s.MountPath, Status: s.Status})
 		}
@@ -85,7 +91,9 @@ func NewPreviewStore() *PreviewStore {
 	return &PreviewStore{m: map[string]*Preview{}, ttl: PreviewTTL, now: time.Now}
 }
 
-// Put registers a validated payload and returns the preview, including its fresh preview_id.
+// Put registers a validated payload and returns the preview, including its fresh preview_id. It
+// purges expired entries and evicts the soonest-expiring previews until the retained count is
+// below the cap, so the store never holds more than maxRetainedPreviews plaintext payloads.
 func (s *PreviewStore) Put(session string, env *Envelope, payload *Payload) (*Preview, error) {
 	if env == nil || payload == nil {
 		return nil, &ValidationError{Msg: "미리보기를 만들 수 없는 백업입니다"}
@@ -107,14 +115,71 @@ func (s *PreviewStore) Put(session string, env *Envelope, payload *Payload) (*Pr
 		Expires:        now.Add(s.ttl),
 	}
 	s.mu.Lock()
-	for k, v := range s.m {
-		if now.After(v.Expires) {
-			delete(s.m, k)
-		}
+	s.purgeLocked(now)
+	for len(s.m) >= maxRetainedPreviews {
+		s.evictSoonestExpiringLocked()
 	}
 	s.m[p.ID] = p
 	s.mu.Unlock()
 	return p, nil
+}
+
+// Purge removes every expired preview and reports how many it removed. Housekeeping calls it so a
+// preview that is never taken still releases its payload when its window closes.
+func (s *PreviewStore) Purge() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.purgeLocked(s.now())
+}
+
+// purgeLocked removes expired entries. The caller holds s.mu.
+func (s *PreviewStore) purgeLocked(now time.Time) int {
+	removed := 0
+	for k, v := range s.m {
+		if now.After(v.Expires) {
+			delete(s.m, k)
+			removed++
+		}
+	}
+	return removed
+}
+
+// evictSoonestExpiringLocked removes the preview with the earliest expiry, breaking ties by id so
+// the choice is deterministic when several previews share a deadline. The caller holds s.mu.
+func (s *PreviewStore) evictSoonestExpiringLocked() {
+	var victim string
+	var expiry time.Time
+	for k, v := range s.m {
+		if victim == "" || v.Expires.Before(expiry) || (v.Expires.Equal(expiry) && k < victim) {
+			victim, expiry = k, v.Expires
+		}
+	}
+	if victim != "" {
+		delete(s.m, victim)
+	}
+}
+
+// DropSession removes the previews issued to one login session and reports how many it removed.
+// Logout calls it so the decrypted payloads do not outlive the session that could apply them.
+func (s *PreviewStore) DropSession(session string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for k, v := range s.m {
+		if v.Session == session {
+			delete(s.m, k)
+			removed++
+		}
+	}
+	return removed
+}
+
+// Clear removes every preview. A successful restore revokes every session, so no preview bound to
+// one may keep its plaintext payload alive.
+func (s *PreviewStore) Clear() {
+	s.mu.Lock()
+	s.m = map[string]*Preview{}
+	s.mu.Unlock()
 }
 
 // Take consumes a preview_id: after this call the id can never be applied again. The id must have

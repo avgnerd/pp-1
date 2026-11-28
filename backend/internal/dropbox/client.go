@@ -85,33 +85,37 @@ func HasSummary(err error, part string) bool {
 	return errors.As(err, &ae) && strings.Contains(ae.Summary, part)
 }
 
-// ambiguousTransportError marks a request whose earlier attempt got no answer and whose final
-// attempt also ended without one. The write may have reached Dropbox, so callers must reconcile it
-// instead of reporting a confirmed failure. A transport error on a fresh request is not wrapped:
-// that attempt never reached the server.
+// ambiguousTransportError marks a request whose write may already have reached Dropbox or whose
+// outcome can no longer be observed. Callers must reconcile it instead of reporting a confirmed
+// failure. A transport error on a fresh request is not wrapped: that attempt never reached the
+// server.
 type ambiguousTransportError struct{ err error }
 
 func (e *ambiguousTransportError) Error() string { return e.err.Error() }
 func (e *ambiguousTransportError) Unwrap() error { return e.err }
 
-// WriteOutcomeUnknown reports whether a failed non-idempotent write may have been applied. It is
-// true for a retried request whose earlier attempt got no definitive answer, and for a request
-// whose final transport attempt ended without one. A missing APIError alone is not enough: a local
-// build error or a cancellation is not an ambiguous write.
+// WriteOutcomeUnknown reports whether a failed non-idempotent write may have been applied or its
+// outcome can no longer be observed. It is true for a retried request whose earlier attempt got no
+// definitive answer, for a request whose final transport attempt ended without one, and for a job
+// that started but could not be observed to completion. A missing APIError alone is not enough: a
+// local build error, or a cancellation before any attempt could apply, is not an ambiguous write.
 func WriteOutcomeUnknown(err error) bool {
 	if err == nil {
 		return false
 	}
-	var ae *APIError
-	if errors.As(err, &ae) {
-		return ae.Retried
-	}
+	// The explicit wrapper wins over a nested APIError: a later stage can know the write outcome is
+	// unknown even when the final attempt ended in a definitive API error.
 	var te *ambiguousTransportError
-	return errors.As(err, &te)
+	if errors.As(err, &te) {
+		return true
+	}
+	var ae *APIError
+	return errors.As(err, &ae) && ae.Retried
 }
 
-// ambiguousFailure wraps err only when an earlier attempt was already ambiguous, so cancellation
-// and sleep deadlines after an unanswered attempt still report an unknown write.
+// ambiguousFailure wraps err only when the write may already have been applied or its outcome can
+// no longer be observed, so cancellation and sleep deadlines after that point still report an
+// unknown write.
 func ambiguousFailure(ambiguous bool, err error) error {
 	if ambiguous {
 		return &ambiguousTransportError{err: err}
@@ -408,7 +412,7 @@ func (c *Client) do(ctx context.Context, build func(token string) (*http.Request
 		case resp.StatusCode == http.StatusUnauthorized && !refreshed && !apiErr.HasPrefix("missing_scope"):
 			refreshed = true
 			if token, err = c.refresh(ctx, token); err != nil {
-				return nil, err
+				return nil, ambiguousFailure(ambiguous, err)
 			}
 			continue
 		case resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries:

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Pagination types.
@@ -203,12 +204,29 @@ func ReadAll(q Queryer) (Settings, error) {
 	return cur, nil
 }
 
+// ErrRestoreInProgress is returned when a settings write arrives while a backup restore owns the
+// store, or when the settings it is based on were read before a restore that has since completed.
+var ErrRestoreInProgress = errors.New("복원 작업이 진행 중입니다. 설정을 저장할 수 없습니다. 잠시 후 다시 시도하세요")
+
 // Store persists settings and notifies listeners on change.
 type Store struct {
 	db        *sql.DB
 	mu        sync.RWMutex
 	cur       Settings
 	listeners []func(old, new Settings)
+
+	// writeMu serializes the database write and the in-memory swap. BeginRestore holds it for the
+	// whole restore, so an update either finishes before the restore starts or fails with
+	// ErrRestoreInProgress instead of writing pre-restore values after the restore commits.
+	writeMu sync.Mutex
+	// restoring is set before BeginRestore waits for an in-flight update, so a new writer fails
+	// immediately instead of blocking for the whole restore. Reads are atomic; the authoritative
+	// check runs again while writeMu is held.
+	restoring atomic.Bool
+	// restoreVersion increments at the start and at the end of every restore. A caller that read
+	// settings before or during the restore passes that revision to UpdateAtRevision, which
+	// refuses the stale write.
+	restoreVersion atomic.Uint64
 }
 
 // Open loads settings from the database, filling missing keys with defaults.
@@ -224,6 +242,9 @@ func Open(db *sql.DB) (*Store, error) {
 
 // ReplaceInMemory installs n as the current settings and calls every listener once. It does not
 // write to the database: the restore path has already stored the values in its own transaction.
+// The caller must hold the gate taken by BeginRestore. ReplaceInMemory deliberately does not take
+// writeMu, because BeginRestore already holds it and re-locking would deadlock; Update is the
+// other memory writer and it fails while restoring.
 func (s *Store) ReplaceInMemory(n Settings) {
 	s.mu.Lock()
 	old := s.cur
@@ -233,6 +254,36 @@ func (s *Store) ReplaceInMemory(n Settings) {
 	for _, fn := range ls {
 		fn(old, n)
 	}
+}
+
+// BeginRestore takes the settings write gate for a restore. It waits for a write that already
+// holds the gate; that write either finishes first or backs out at its post-lock restore check. A
+// write that starts while the gate is held fails with ErrRestoreInProgress. Every call bumps the
+// restore version, and EndRestore bumps it again once the restored settings are published, so a
+// read-modify-write that began before or during the restore is refused. The caller must pair this
+// with EndRestore on every path.
+func (s *Store) BeginRestore() {
+	// Set the flag before waiting for writeMu so a new update fails fast rather than hanging for
+	// the whole restore. The post-lock check in writeAtRevision is still authoritative.
+	s.restoring.Store(true)
+	s.writeMu.Lock()
+	s.restoreVersion.Add(1)
+}
+
+// EndRestore publishes the end of the restore and releases the gate taken by BeginRestore. It
+// bumps the restore version again, under the gate and after ReplaceInMemory has installed the
+// restored settings, so a revision captured during the restore is stale by the time the gate
+// opens and its write is refused instead of overwriting the restored values.
+func (s *Store) EndRestore() {
+	s.restoreVersion.Add(1)
+	s.restoring.Store(false)
+	s.writeMu.Unlock()
+}
+
+// RestoreVersion returns the current restore generation. A settings read that will later be
+// written back must capture this first and pass it to UpdateAtRevision.
+func (s *Store) RestoreVersion() uint64 {
+	return s.restoreVersion.Load()
 }
 
 // Get returns a copy of the current settings.
@@ -249,40 +300,72 @@ func (s *Store) OnChange(fn func(old, new Settings)) {
 	s.mu.Unlock()
 }
 
-// Update validates and persists new settings.
+// Update validates and persists new settings. It serializes the database write and the in-memory
+// swap on one write mutex and refuses to run during a restore.
 func (s *Store) Update(n Settings) error {
-	if err := n.Validate(); err != nil {
+	return s.UpdateAtRevision(s.RestoreVersion(), n)
+}
+
+// UpdateAtRevision validates and persists n only if no restore has happened since rev was read.
+// A caller that builds n from Get must capture RestoreVersion before Get and pass it here, so a
+// restore that starts or completes in between rejects the stale write with ErrRestoreInProgress.
+// Listeners run while writeMu is still held, so they finish in write order and BeginRestore waits
+// for a pending notification before it starts replacing the runtime. A listener must not call
+// Update, UpdateAtRevision or BeginRestore (that would deadlock); reading the store is fine.
+func (s *Store) UpdateAtRevision(rev uint64, n Settings) error {
+	if s.restoring.Load() {
+		return ErrRestoreInProgress
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	// A restore may have started after the fast check, or completed before this lock was taken.
+	// Both cases mean the caller's revision no longer describes the store.
+	if s.restoring.Load() || s.restoreVersion.Load() != rev {
+		return ErrRestoreInProgress
+	}
+	old, ls, err := s.writeLocked(n)
+	if err != nil {
 		return err
+	}
+	// The state mutex is released, so a listener may read the store; writeMu stays held so a
+	// restore cannot publish the restored settings between this write and its notification.
+	for _, fn := range ls {
+		fn(old, n)
+	}
+	return nil
+}
+
+// writeLocked performs the database write and the in-memory swap. The caller holds writeMu.
+func (s *Store) writeLocked(n Settings) (Settings, []func(old, new Settings), error) {
+	if err := n.Validate(); err != nil {
+		return Settings{}, nil, err
 	}
 	b, err := json.Marshal(n)
 	if err != nil {
-		return err
+		return Settings{}, nil, err
 	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(b, &m); err != nil {
-		return err
+		return Settings{}, nil, err
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return Settings{}, nil, err
 	}
 	for k, v := range m {
 		if _, err := tx.Exec(`INSERT INTO settings(key, value) VALUES(?, ?)
 			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, string(v)); err != nil {
 			tx.Rollback()
-			return err
+			return Settings{}, nil, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return Settings{}, nil, err
 	}
 	s.mu.Lock()
 	old := s.cur
 	s.cur = n
 	ls := append([]func(old, new Settings){}, s.listeners...)
 	s.mu.Unlock()
-	for _, fn := range ls {
-		fn(old, n)
-	}
-	return nil
+	return old, ls, nil
 }

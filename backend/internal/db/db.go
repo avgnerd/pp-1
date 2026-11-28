@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
@@ -75,7 +76,7 @@ func Open(dataDir string) (*sql.DB, error) {
 
 // OpenPath opens a database file (or ":memory:" style DSN) and migrates it.
 func OpenPath(path string) (*sql.DB, error) {
-	dsn := "file:" + filepath.ToSlash(path) +
+	dsn := "file:" + sqliteURIPath(path) +
 		"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
 	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -92,6 +93,16 @@ func OpenPath(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	return d, nil
+}
+
+// sqliteURIPath converts a filesystem path to the path part of a SQLite file: URI. The path is
+// not URI-encoded data, so '%' must be escaped first or the escapes added below would be read as
+// part of the original path. Leaving '?' or '#' literal would turn the rest of the path, including
+// the pragma query, into a query string or fragment. ':' is deliberately left alone (":memory:"
+// and Windows drive letters rely on it), and so are characters that are legal inside a URI path.
+func sqliteURIPath(path string) string {
+	escaped := strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace(filepath.ToSlash(path))
+	return escaped
 }
 
 // Migrate applies pending migrations. It is idempotent.

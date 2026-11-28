@@ -152,9 +152,14 @@ func searchOne(ctx context.Context, sm *storage.Manager, s storage.Storage, dbxD
 	for {
 		var batch []vfs.Entry
 		for _, m := range res.Matches {
+			// search_v2 results are union values: an "other" outer tag has no metadata, and a
+			// metadata wrapper can still hold a deleted entry. Neither is a live file or folder.
+			if m.Metadata.Tag != "metadata" {
+				continue
+			}
 			md := m.Metadata.Metadata
 			isDir := md.Tag == "folder"
-			if (opt.Kind == KindFolder && !isDir) || (opt.Kind == KindFile && isDir) || md.Tag == "deleted" {
+			if (md.Tag != "file" && !isDir) || (opt.Kind == KindFolder && !isDir) || (opt.Kind == KindFile && isDir) {
 				continue
 			}
 			if !pathutil.HasPrefix(md.PathDisplay, dbxDir) {

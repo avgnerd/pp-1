@@ -215,7 +215,7 @@ func (s *Service) List(ctx context.Context, vpath string, opt ListOptions) (*Lis
 
 func (s *Service) virtualChildren(vp string) []Entry {
 	seen := map[string]bool{}
-	var out []Entry
+	out := []Entry{}
 	for _, st := range s.St.All() {
 		if !pathutil.HasPrefix(st.MountPath, vp) || strings.EqualFold(st.MountPath, vp) {
 			continue
@@ -282,11 +282,15 @@ func toEntry(m dropbox.Metadata, t Target) Entry {
 
 // SiblingFiles returns the files in the same folder as vpath, sorted, for prev/next navigation.
 func (s *Service) SiblingFiles(ctx context.Context, vpath, sortBy, order string) ([]Entry, error) {
-	r, err := s.List(ctx, pathutil.Parent(vpath), ListOptions{Sort: sortBy, Order: order})
+	vp, err := pathutil.Clean(vpath)
 	if err != nil {
 		return nil, err
 	}
-	var out []Entry
+	r, err := s.List(ctx, pathutil.Parent(vp), ListOptions{Sort: sortBy, Order: order})
+	if err != nil {
+		return nil, err
+	}
+	out := []Entry{}
 	for _, e := range r.Entries {
 		if e.Type == TypeFile {
 			out = append(out, e)

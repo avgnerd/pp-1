@@ -52,11 +52,11 @@ type Cache struct {
 	done     chan struct{}
 	stopOnce sync.Once
 
-	// invalidationMu orders an explicit removal against the publish step of a background load. A
-	// load captures the counter before it starts and publishes only while the counter is unchanged,
-	// so a value a removal made stale is never written back for the rest of its TTL. The same
-	// boundary forgets the in-flight load of every key a removal takes out, so a caller that arrives
-	// after the removal starts a new load instead of joining one that predates it.
+	// invalidationMu orders an explicit removal against the publish step of a load. A load or a
+	// caller-driven scan captures the counter before it reads and publishes only while the counter
+	// is unchanged, so a value a removal made stale is never written back for the rest of its TTL.
+	// The same boundary forgets the in-flight load of every key a removal takes out, so a caller
+	// that arrives after the removal starts a new load instead of joining one that predates it.
 	invalidationMu sync.Mutex
 	invalidation   uint64
 	loading        map[string]uint64 // generation captured by the load in flight for a key
@@ -229,6 +229,16 @@ func (c *Cache) Clear() {
 	}
 }
 
+// InvalidationGeneration returns the counter that advances on every explicit removal. Capture it
+// before work that reads data outside the cache, then pass it to SetIfCurrent so a removal that
+// runs during the work keeps the result out of the cache. The read holds the same boundary as the
+// removals, so the returned value is never torn.
+func (c *Cache) InvalidationGeneration() uint64 {
+	c.invalidationMu.Lock()
+	defer c.invalidationMu.Unlock()
+	return c.invalidation
+}
+
 // GetOrLoad returns the cached value or calls load once per key across concurrent callers.
 // load returns the value, its estimated size, and its TTL (ttl <= 0 means "do not cache").
 //
@@ -269,7 +279,7 @@ func (c *Cache) GetOrLoad(ctx context.Context, key string, timeout time.Duration
 		if err != nil {
 			return nil, err
 		}
-		c.publishIfCurrent(generation, key, val, size, ttl)
+		c.SetIfCurrent(generation, key, val, size, ttl)
 		return val, nil
 	})
 	select {
@@ -280,10 +290,13 @@ func (c *Cache) GetOrLoad(ctx context.Context, key string, timeout time.Duration
 	}
 }
 
-// publishIfCurrent caches val only while no explicit removal has run since generation was captured.
-// The comparison and the write hold the same boundary the removals take, so a removal either runs
+// SetIfCurrent caches val only while no explicit removal has run since generation was captured,
+// where generation comes from InvalidationGeneration. It gives a load that does not run through
+// GetOrLoad, such as a scan the caller drives, the same rule: a value read before a removal is
+// still returned to its own caller, but it is not written back for the rest of the TTL. The
+// comparison and the write hold the same boundary the removals take, so a removal either runs
 // after the write and takes the entry out, or runs before it and the load stays uncached.
-func (c *Cache) publishIfCurrent(generation uint64, key string, val any, size int64, ttl time.Duration) {
+func (c *Cache) SetIfCurrent(generation uint64, key string, val any, size int64, ttl time.Duration) {
 	c.invalidationMu.Lock()
 	defer c.invalidationMu.Unlock()
 	if c.invalidation != generation {
