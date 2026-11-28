@@ -114,8 +114,13 @@ func (s *Service) Get(ctx context.Context, storageID int64, dbxPath, rev, size s
 	name := cacheName(storageID, dbxPath, rev, size)
 	cacheable := rev != ""
 	if cacheable {
-		if b, err := os.ReadFile(filepath.Join(s.dir, name)); err == nil {
-			s.diskMu.Lock()
+		// Read and update the access time under the lock evict and Clear hold while they remove
+		// files. Holding it across the read keeps a removal from deleting the file between the read
+		// and the index update, which on Windows fails with a sharing violation and leaves the index
+		// and the disk disagreeing.
+		s.diskMu.Lock()
+		b, err := os.ReadFile(filepath.Join(s.dir, name))
+		if err == nil {
 			if fi, ok := s.files[name]; ok {
 				fi.access = time.Now()
 				s.files[name] = fi
@@ -123,6 +128,7 @@ func (s *Service) Get(ctx context.Context, storageID int64, dbxPath, rev, size s
 			s.diskMu.Unlock()
 			return b, nil
 		}
+		s.diskMu.Unlock()
 	}
 	ch := make(chan result, 1)
 	key := fmt.Sprintf("%d|%s", storageID, size)
@@ -131,7 +137,7 @@ func (s *Service) Get(ctx context.Context, storageID int64, dbxPath, rev, size s
 	if b == nil {
 		b = &batch{}
 		s.pending[key] = b
-		b.timer = time.AfterFunc(s.window, func() { s.flush(key, storageID, size) })
+		b.timer = time.AfterFunc(s.window, func() { s.flush(key, b, storageID, size) })
 	}
 	b.reqs = append(b.reqs, request{path: dbxPath, done: ch})
 	if len(b.reqs) >= dropbox.MaxThumbBatch {
@@ -154,12 +160,17 @@ func (s *Service) Get(ctx context.Context, storageID int64, dbxPath, rev, size s
 	}
 }
 
-func (s *Service) flush(key string, storageID int64, size string) {
+// flush runs b only if it still owns the key. A full batch can replace the pending batch after its
+// timer fired but before this callback got the lock, and that old callback must not run the new one.
+func (s *Service) flush(key string, b *batch, storageID int64, size string) {
 	s.mu.Lock()
-	b := s.pending[key]
+	if s.pending[key] != b {
+		s.mu.Unlock()
+		return
+	}
 	delete(s.pending, key)
 	s.mu.Unlock()
-	if b != nil && len(b.reqs) > 0 {
+	if len(b.reqs) > 0 {
 		s.run(storageID, size, b.reqs)
 	}
 }
@@ -255,7 +266,11 @@ func (s *Service) evict() {
 		if s.total <= target {
 			break
 		}
-		_ = os.Remove(filepath.Join(s.dir, e.name))
+		if err := os.Remove(filepath.Join(s.dir, e.name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			// The file is still on disk, typically because Windows denied the delete while a reader
+			// had it open. Keep it indexed and charged so a later evict can retry it.
+			continue
+		}
 		s.total -= e.fi.size
 		delete(s.files, e.name)
 	}
@@ -268,13 +283,16 @@ func (s *Service) Usage() (int, int64) {
 	return len(s.files), s.total
 }
 
-// Clear deletes every cached thumbnail.
+// Clear deletes every cached thumbnail. A file Windows refuses to delete stays indexed and charged,
+// so the cache never loses track of a file that is still on disk and a later Clear can retry it.
 func (s *Service) Clear() {
 	s.diskMu.Lock()
 	defer s.diskMu.Unlock()
-	for n := range s.files {
-		os.Remove(filepath.Join(s.dir, n))
+	for n, fi := range s.files {
+		if err := os.Remove(filepath.Join(s.dir, n)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		delete(s.files, n)
+		s.total -= fi.size
 	}
-	s.files = map[string]fileInfo{}
-	s.total = 0
 }
