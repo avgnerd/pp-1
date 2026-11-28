@@ -310,6 +310,9 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
       resumePlay.current = true
       resumeStoppedHls()
     },
+    // Autoplay has to stay on the element until it actually starts. Clearing it on metadata
+    // re-renders without the autoplay attribute before the browser begins playback.
+    onPlaying: () => setLoadedOnce(true),
     onPause: (e: React.SyntheticEvent<HTMLMediaElement>) => {
       const el = e.currentTarget
       if (el.isConnected && el.readyState > 0 && !el.error) resumePlay.current = false
@@ -338,7 +341,6 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
       if (resumePlay.current) {
         el.play().catch(() => {})
       }
-      setLoadedOnce(true)
     },
     onVolumeChange: (e: React.SyntheticEvent<HTMLMediaElement>) => setVolume(e.currentTarget.volume, e.currentTarget.muted),
     onEnded: () => {
