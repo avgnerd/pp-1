@@ -1,7 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useQuery } from "@tanstack/react-query"
 import { ArrowUpIcon, FolderIcon } from "lucide-react"
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useForm } from "react-hook-form"
 import { z } from "zod"
 
@@ -21,7 +21,7 @@ import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
-import { api, type Entry, type OpResult } from "@/lib/api"
+import { ApiError, api, type Entry, type OpResult } from "@/lib/api"
 import { baseName, isWithin, joinPath, parentPath, samePath } from "@/lib/paths"
 import { afterChange, useMounts } from "@/lib/queries"
 import { useSelection } from "@/stores/ui"
@@ -44,8 +44,26 @@ function reportResult(verb: string, r: OpResult) {
   })
 }
 
+// React StrictMode runs every effect twice (setup, cleanup, setup) in development, so a plain
+// unmount cleanup would close a dialog that is still on screen. Each mounted instance keeps a
+// stable id, and the queued microtask closes only when that id has not re-registered. A StrictMode
+// re-setup cancels the close; a real unmount, or a navigation that mounts a different instance,
+// does not, so the stale dialog state is cleared.
+let nextDialogId = 0
+const mountedDialogs = new Set<number>()
+
 export function ActionDialogs() {
   const { kind, entries, close } = useActionDialog()
+  const [id] = useState(() => ++nextDialogId)
+  useEffect(() => {
+    mountedDialogs.add(id)
+    return () => {
+      mountedDialogs.delete(id)
+      queueMicrotask(() => {
+        if (!mountedDialogs.has(id)) close()
+      })
+    }
+  }, [id, close])
   return (
     <>
       <RenameDialog open={kind === "rename"} entry={entries[0]} onClose={close} />
@@ -85,6 +103,7 @@ function RenameForm({ entry, onClose }: { entry: Entry; onClose: () => void }) {
       toast.add({ title: "이름을 바꿨습니다", description: name, type: "success", timeout: 3000 })
       onClose()
     } catch (e) {
+      if (e instanceof ApiError && e.unknown) afterChange([entry.path, joinPath(parentPath(entry.path), name)])
       setServerError((e as Error).message)
     }
   })
@@ -160,14 +179,16 @@ function DestinationPicker({ mode, entries, onClose }: { mode: "move" | "copy"; 
   const run = async () => {
     setBusy(true)
     setError(null)
+    const paths = entries.map((e) => e.path)
     try {
-      const paths = entries.map((e) => e.path)
       const r = mode === "move" ? await api.move(paths, dir) : await api.copy(paths, dir)
       afterChange([...paths, dir, ...paths.map((p) => joinPath(dir, baseName(p)))])
       reportResult(verb, r)
       clearSel()
       onClose()
     } catch (e) {
+      // A 502 with unknown: true means Dropbox may already have applied the operation.
+      if (e instanceof ApiError && e.unknown) afterChange([...paths, dir, ...paths.map((p) => joinPath(dir, baseName(p)))])
       setError((e as Error).message)
     } finally {
       setBusy(false)

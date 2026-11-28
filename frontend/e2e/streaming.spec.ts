@@ -339,6 +339,83 @@ async function convert(page: Page) {
   await page.keyboard.press("Escape")
 }
 
+// #4: a direct URL has no cached config yet. The player must wait for it instead of mounting a
+// source with autoplay and transcoding guessed as false, which then remounts and burns loadedOnce.
+test("a direct URL holds the skeleton until config resolves and then autoplays", async ({ page }) => {
+  test.setTimeout(90_000)
+  let configPending = false
+  let released = false
+  let releaseConfig = () => {}
+  await page.route("**/api/config", async route => {
+    configPending = true
+    if (released) return route.continue()
+    await new Promise<void>(resolve => { releaseConfig = resolve })
+    await route.continue()
+  })
+  const raw: string[] = []
+  page.on("request", request => {
+    if (new URL(request.url()).pathname === "/api/fs/raw") raw.push(request.url())
+  })
+  const playerChunk = page.waitForResponse(response => /\/media-player-[^/]+\.js$/.test(new URL(response.url()).pathname))
+  await page.goto("/demo.mp4")
+  await playerChunk
+  await expect.poll(() => configPending).toBe(true)
+  // The lazy player chunk has loaded, so its own render is what decides the DOM below: without the
+  // fix it would already have a video element and an original-stream request, both created from
+  // the pending config's defaults.
+  await expect(page.locator('[data-slot="skeleton"].aspect-video').first()).toBeVisible()
+  await page.waitForTimeout(1_000)
+  await expect(page.locator("video")).toHaveCount(0)
+  expect(raw).toEqual([])
+  released = true
+  releaseConfig()
+  const video = page.locator("video")
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
+  const start = await video.evaluate((v: HTMLVideoElement) => v.currentTime)
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(start + 0.5)
+  await expect.poll(() => raw.length).toBeGreaterThan(0)
+})
+
+// #26-4: the detected VR mode has to exist on the first render. Effect-based detection mounts the
+// original once with proxy off, so the requests would include a non-proxied original URL.
+test("a probe-detected VR video requests only proxied originals from the first render", async ({ page }) => {
+  test.setTimeout(90_000)
+  await page.route("**/api/media/probe?**", async route => {
+    const response = await route.fetch()
+    const body = await response.json() as { probe?: Record<string, unknown> }
+    const probe = (body.probe ?? {}) as Record<string, unknown>
+    await route.fulfill({ json: { ...body, probe: { ...probe, vr: { projection: "360", stereo: "mono", source: "metadata" } } } })
+  })
+  const raw: string[] = []
+  page.on("request", request => {
+    if (new URL(request.url()).pathname === "/api/fs/raw") raw.push(request.url())
+  })
+  await ready(page)
+  await holdPlayback(page)
+  await expect.poll(() => raw.length).toBeGreaterThan(0)
+  const proxies = raw.map(href => new URL(href).searchParams.get("proxy"))
+  expect(proxies.length).toBeGreaterThan(0)
+  expect(proxies.every(proxy => proxy === "1")).toBe(true)
+  expect(proxies.filter(proxy => proxy !== "1")).toEqual([])
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentSrc || v.src)).toContain("proxy=1")
+})
+
+// #26-3: 720p is saved but the 480p source leaves that choice out of the menu. The radio group has
+// to be pointed at a choice it renders instead of a value that selects nothing.
+test("a saved quality the source cannot offer checks the original choice", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("dvfs-prefs", JSON.stringify({ state: { quality: "720" }, version: 0 })))
+  await page.route("**/api/media/probe?**", async route => {
+    const response = await route.fetch()
+    const body = await response.json() as { probe?: { video?: Record<string, unknown> } }
+    await route.fulfill({ json: { ...body, probe: { ...body.probe, video: { ...body.probe?.video, height: 480 } } } })
+  })
+  await ready(page)
+  await holdPlayback(page)
+  const menu = await openSubmenu(page, /화질/)
+  await expect(menu.getByRole("menuitemradio", { name: /^원본/ })).toHaveAttribute("aria-checked", "true")
+  await expect(page.getByRole("menuitemradio", { name: "720p", exact: true })).toHaveCount(0)
+})
+
 // The player heartbeats its HLS session every 20 s (media-player.tsx), which is what keeps the
 // server from reaping a paused session. Record when each beat leaves the page, keyed by the session
 // it names: a beat the browser's network stack drops produces a request with no response, so a
@@ -804,6 +881,51 @@ test("an audio error reopens the dialog while its close transition is still runn
   expect(states).toContain("ending")
   expect(states[states.length - 1]).toBe("open")
   await expect(dialog).toBeVisible()
+})
+
+// #1: the backend's converted audio is a single media playlist. HlsAudio's multivariant parser
+// finds no tracks in it, so this test only passes when the audio path uses the hls.js adapter.
+test("converted audio plays from a single media playlist and recovers from a gone session", async ({ page }) => {
+  test.setTimeout(90_000)
+  const opens: { mode?: string }[] = []
+  page.on("request", request => {
+    if (request.method() !== "POST" || new URL(request.url()).pathname !== "/api/media/hls") return
+    const body = request.postDataJSON() as { mode?: string } | null
+    if (body) opens.push(body)
+  })
+  await page.goto("/demo.wma")
+  await expect.poll(() => opens.length).toBeGreaterThanOrEqual(1)
+  expect(opens[0].mode).toBe("audio")
+  // The HLS element is a hidden video, so the audio skin still has to drive a media element that
+  // is ready and advancing. Audio autoplay is on in the fixture config.
+  const media = page.locator("video, audio").first()
+  await expect.poll(() => media.evaluate((el: HTMLMediaElement) => el.readyState)).toBeGreaterThanOrEqual(2)
+  const start = await media.evaluate((el: HTMLMediaElement) => el.currentTime)
+  await expect.poll(() => media.evaluate((el: HTMLMediaElement) => el.currentTime)).toBeGreaterThan(start + 0.5)
+
+  let failures = 0
+  await page.route("**/audio_seg*.m4s", async route => {
+    const segment = /audio_seg(\d+)\.m4s$/.exec(new URL(route.request().url()).pathname)
+    if (segment && Number(segment[1]) >= 50) {
+      failures++
+      await route.fulfill({ status: 410, json: { code: "session_gone" } })
+    } else await route.continue()
+  })
+  await media.evaluate((el: HTMLMediaElement) => { el.currentTime = 200 })
+  await expect.poll(() => failures).toBeGreaterThanOrEqual(3)
+  const dialog = page.getByRole("alertdialog")
+  const retry = page.getByRole("button", { name: "다시 재생", exact: true })
+  await expect(dialog).toBeVisible()
+  await expect(retry).toBeVisible()
+  await page.unroute("**/audio_seg*.m4s")
+  await retry.click()
+  await expect(dialog).not.toBeVisible()
+  await expect.poll(() => media.evaluate((el: HTMLMediaElement) => el.readyState)).toBeGreaterThanOrEqual(2)
+  await expect.poll(() => media.evaluate((el: HTMLMediaElement) => el.currentTime)).toBeGreaterThanOrEqual(199.5)
+  await expect.poll(() => media.evaluate((el: HTMLMediaElement) => el.paused)).toBe(false)
+  const resumed = await media.evaluate((el: HTMLMediaElement) => el.currentTime)
+  await expect.poll(() => media.evaluate((el: HTMLMediaElement) => el.currentTime)).toBeGreaterThan(resumed + 0.5)
+  expect(opens.length).toBeGreaterThanOrEqual(2)
 })
 
 test("VR renders current decoded frames after conversion, HLS recovery and a fresh link", async ({ page }) => {
@@ -1350,6 +1472,11 @@ test("a segment past the end ends playback without opening another session", asy
     if (response.request().method() !== "POST" || new URL(response.url()).pathname !== "/api/media/hls") return
     void response.json().then((body: { id?: string }) => { if (body?.id) opens.push(body.id) }).catch(() => {})
   })
+  const mediaSessions = new Set<string>()
+  page.on("request", request => {
+    const session = /^\/media\/([^/]+)\//.exec(new URL(request.url()).pathname)
+    if (session) mediaSessions.add(session[1])
+  })
   await convert(page)
   await expect.poll(() => opens.length).toBe(1)
   let failures = 0
@@ -1369,6 +1496,44 @@ test("a segment past the end ends playback without opening another session", asy
   // The frame the user was at, not a reset to the start and not a seek into data that does not exist.
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(229)
   await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2)
+
+  // #5: past_end stopped hls.js. Seeking back into the media and playing has to start it again;
+  // otherwise the player sits at the new position with no request for a segment. The buffer around
+  // the start was evicted by the 230 s seek, so playback cannot advance without a fresh segment.
+  const restartedSegments: number[] = []
+  page.on("request", request => {
+    const segment = /seg(\d+)\.ts$/.exec(new URL(request.url()).pathname)
+    if (segment) restartedSegments.push(Number(segment[1]))
+  })
+  await page.locator("video").evaluate((v: HTMLVideoElement) => {
+    v.currentTime = 0
+    v.play().catch(() => {})
+  })
+  await expect.poll(() => restartedSegments.some(n => n < 10)).toBe(true)
+  expect(opens).toHaveLength(1)
+  const restartedAt = await page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(restartedAt + 0.5)
+
+  // Pressing the player's Play at the retained end is a replay, not a seek. It has to restart from
+  // the beginning; starting a load at the stopped position would fetch the past_end segment again.
+  const beforeSecondEnd = failures
+  await page.locator("video").evaluate((v: HTMLVideoElement) => {
+    v.currentTime = 230
+    v.play().catch(() => {})
+  })
+  await expect.poll(() => failures).toBeGreaterThan(beforeSecondEnd)
+  const play = page.getByRole("button", { name: "Play", exact: true })
+  await expect(play, "a second past-end segment stops playback again").toBeVisible()
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true)
+  const replayMark = restartedSegments.length
+  await play.click()
+  await expect.poll(() => restartedSegments.slice(replayMark).some(n => n < 10)).toBe(true)
+  // Past 0.5 s after the restart, and no longer at the retained end.
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime < 5)).toBe(true)
+  const replayAt = await page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)
+  await expect.poll(() => page.locator("video").evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(replayAt + 0.5)
+  expect(opens).toHaveLength(1)
+  expect([...mediaSessions]).toEqual([opens[0]])
 })
 
 // The session a player leaves is closed two seconds later, while its query data lives for five.

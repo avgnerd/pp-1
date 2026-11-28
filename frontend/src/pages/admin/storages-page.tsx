@@ -29,15 +29,17 @@ import { toast } from "@/components/ui/toast"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { api, ApiError, type AuthStart, type Storage } from "@/lib/api"
 import { copyText } from "@/lib/paths"
-import { keys, queryClient } from "@/lib/queries"
+import { keys, queryClient, stopAllFolderSizeStreams } from "@/lib/queries"
 
 const APP_CONSOLE = "https://www.dropbox.com/developers/apps"
 
 function refreshAll() {
+  stopAllFolderSizeStreams()
+  queryClient.removeQueries({ queryKey: ["fsize"] })
   queryClient.invalidateQueries({ queryKey: ["storages"] })
   queryClient.invalidateQueries({ queryKey: keys.mounts })
   // A storage change adds, moves, or removes a mount, so every path-keyed cache is stale.
-  for (const key of ["list", "stat", "siblings", "picker"]) {
+  for (const key of ["list", "stat", "siblings", "picker", "archive"]) {
     queryClient.invalidateQueries({ queryKey: [key] })
   }
 }

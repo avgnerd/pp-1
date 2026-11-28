@@ -17,7 +17,7 @@ import { toast } from "@/components/ui/toast"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { api, type Settings } from "@/lib/api"
 import { formatBytes } from "@/lib/format"
-import { keys, queryClient } from "@/lib/queries"
+import { keys, queryClient, stopAllFolderSizeStreams } from "@/lib/queries"
 
 const int = (min: number, max: number, label: string) =>
   z.number({ message: `${label}을(를) 숫자로 입력하세요` }).int(`${label}은(는) 정수여야 합니다`).min(min, `${label}은(는) ${min} 이상이어야 합니다`).max(max, `${label}은(는) ${max} 이하여야 합니다`)
@@ -230,9 +230,16 @@ function SystemStatus() {
     setBusy(true)
     try {
       await api.clearCache(thumbs)
+      stopAllFolderSizeStreams()
+      queryClient.removeQueries({ queryKey: ["fsize"] })
       queryClient.invalidateQueries({ queryKey: ["system"] })
-      queryClient.invalidateQueries({ queryKey: ["list"] })
+      // The server dropped every cached response, so every path-keyed cache is stale too.
+      for (const key of ["list", "stat", "siblings", "picker", "archive"]) {
+        queryClient.invalidateQueries({ queryKey: [key] })
+      }
       toast.add({ title: thumbs ? "캐시와 썸네일을 비웠습니다" : "캐시를 비웠습니다", type: "success", timeout: 2500 })
+    } catch (e) {
+      toast.add({ title: "캐시를 비우지 못했습니다", description: (e as Error).message, type: "error" })
     } finally {
       setBusy(false)
     }
