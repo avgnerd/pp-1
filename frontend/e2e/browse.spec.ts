@@ -840,3 +840,150 @@ test("saving a new archive size limit refreshes an open archive preview", async 
   ).toHaveCount(0)
   expect(budgetRequests).toEqual([1, 64])
 })
+
+test("an encrypted archive with null entries shows the password notice", async ({
+  page,
+}) => {
+  await page.route("**/api/fs/archive?**", (route) =>
+    route.fulfill({
+      json: {
+        listing: {
+          format: "rar",
+          entries: null,
+          truncated: false,
+          encrypted: true,
+        },
+        sequential: false,
+        budget_mb: 1,
+      },
+    })
+  )
+  await page.goto(server.origin + "/synthetic/archive.rar")
+  await expect(
+    page.getByText("암호가 걸린 압축 파일입니다", { exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByText(/RAR 압축 파일, 파일 0개/)
+  ).toBeVisible()
+  await expect(
+    page.getByRole("tree", { name: "압축 파일 내용" })
+  ).toBeVisible()
+})
+
+test("an unknown rename outcome refreshes the folder and keeps the dialog open", async ({
+  page,
+}) => {
+  await page.route("**/api/fs/rename", (route) =>
+    route.fulfill({
+      status: 502,
+      json: { error: "결과를 확인할 수 없습니다", unknown: true },
+    })
+  )
+  await page.goto(server.origin + "/synthetic")
+  await page
+    .getByRole("link", { name: "archive.rar", exact: true })
+    .click({ button: "right" })
+  await page
+    .getByRole("menuitem", { name: "이름 바꾸기", exact: true })
+    .click()
+  const dialog = page.getByRole("dialog")
+  await dialog
+    .getByLabel("새 이름", { exact: true })
+    .fill("archive-renamed.rar")
+
+  // The dialog's cache invalidation only runs when ApiError keeps the server's unknown flag.
+  const parsed = await page.evaluate(async () => {
+    const modulePath = "/src/lib/api.ts"
+    const { api } = await import(modulePath)
+    try {
+      await api.rename("/synthetic/archive.rar", "archive-probe.rar")
+    } catch (e) {
+      return (e as { unknown?: boolean }).unknown === true
+    }
+    return false
+  })
+  expect(parsed).toBe(true)
+
+  const listCalls = () =>
+    server.requests.filter(
+      (r: { path: string; query: Record<string, string> }) =>
+        r.path === "/api/fs/list" && r.query.path === "/synthetic"
+    ).length
+  const before = listCalls()
+  await dialog
+    .getByRole("button", { name: "이름 바꾸기", exact: true })
+    .click()
+  await expect(
+    dialog.getByText("결과를 확인할 수 없습니다", { exact: true })
+  ).toBeVisible()
+  await expect.poll(listCalls).toBeGreaterThan(before)
+  await expect(dialog).toBeVisible()
+})
+
+test("navigating away closes a dialog left open and it does not reopen", async ({
+  page,
+}) => {
+  await page.goto(server.origin + "/synthetic")
+  await page
+    .getByRole("link", { name: "archive.rar", exact: true })
+    .click({ button: "right" })
+  await page
+    .getByRole("menuitem", { name: "이름 바꾸기", exact: true })
+    .click()
+  await expect(
+    page.getByRole("dialog").getByLabel("새 이름", { exact: true })
+  ).toBeVisible()
+
+  await navigate(page, "synthetic/a")
+  await expect(link(page, "only-A")).toBeVisible()
+  await expect(page.getByRole("dialog")).toHaveCount(0)
+
+  await navigate(page, "synthetic")
+  await expect(link(page, "archive.rar")).toBeVisible()
+  await expect(page.getByRole("dialog")).toHaveCount(0)
+})
+
+test("a fractional page query behaves as page one", async ({ page }) => {
+  const offsets: string[] = []
+  await page.route("**/api/fs/list?**", async (route) => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get("path") === "/synthetic/pages")
+      offsets.push(url.searchParams.get("offset") ?? "")
+    await route.continue()
+  })
+  await page.goto(server.origin + "/synthetic/pages?page=1.5")
+  await expect(link(page, "item001")).toBeVisible()
+  await expect(
+    page.locator('nav[aria-label="pagination"] a[aria-current="page"]')
+  ).toHaveText("1")
+  await expect(page.locator('[aria-label="1.5쪽"]')).toHaveCount(0)
+  expect(offsets).toContain("0")
+  expect(offsets).not.toContain("15")
+})
+
+test("a restore 401 dispatches the unauthorized event", async ({ page }) => {
+  await page.route("**/api/admin/restore/apply", (route) =>
+    route.fulfill({
+      status: 401,
+      json: { error: "세션이 만료되었습니다" },
+    })
+  )
+  await page.goto(server.origin + "/synthetic")
+  const fired = await page.evaluate(async () => {
+    let fired = false
+    const onUnauthorized = () => {
+      fired = true
+    }
+    window.addEventListener("dvfs:unauthorized", onUnauthorized)
+    const modulePath = "/src/lib/api.ts"
+    const { api } = await import(modulePath)
+    try {
+      await api.admin.applyRestore("preview-1")
+    } catch {
+      /* expected */
+    }
+    window.removeEventListener("dvfs:unauthorized", onUnauthorized)
+    return fired
+  })
+  expect(fired).toBe(true)
+})

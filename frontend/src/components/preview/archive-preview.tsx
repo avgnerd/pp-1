@@ -16,7 +16,7 @@ interface Node {
   children: Node[]
 }
 
-function buildTree(entries: ArchiveEntry[]): Node {
+function buildTree(entries: ArchiveEntry[] | null | undefined): Node {
   const root: Node = { name: "", path: "", dir: true, size: 0, children: [] }
   const index = new Map<string, Node>([["", root]])
   const ensure = (p: string): Node => {
@@ -29,7 +29,7 @@ function buildTree(entries: ArchiveEntry[]): Node {
     index.set(p, n)
     return n
   }
-  for (const e of entries) {
+  for (const e of entries ?? []) {
     const p = e.name.replace(/\/+$/, "")
     if (e.dir) {
       ensure(p)
@@ -51,7 +51,10 @@ function buildTree(entries: ArchiveEntry[]): Node {
 
 export default function ArchivePreview({ entry }: { entry: Entry }) {
   const q = useQuery({ queryKey: ["archive", entry.path, entry.rev], queryFn: () => api.archive(entry.path), staleTime: 10 * 60_000 })
-  const tree = useMemo(() => (q.data ? buildTree(q.data.listing.entries) : null), [q.data])
+  // The server sends "entries": null for encrypted or empty archives.
+  const listing = q.data?.listing
+  const entries = useMemo(() => listing?.entries ?? [], [listing])
+  const tree = useMemo(() => (q.data ? buildTree(entries) : null), [q.data, entries])
 
   if (q.isPending) return <Skeleton className="h-80 w-full" />
   if (q.isError) {
@@ -62,8 +65,9 @@ export default function ArchivePreview({ entry }: { entry: Entry }) {
       </Alert>
     )
   }
-  const { listing, budget_mb } = q.data
-  const files = listing.entries.filter((e) => !e.dir).length
+  if (!listing) return null
+  const { budget_mb } = q.data
+  const files = entries.filter((e) => !e.dir).length
   return (
     <div className="flex flex-col gap-2">
       <p className="text-sm text-muted-foreground tabular-nums">

@@ -83,7 +83,10 @@ const shell = createRoute({
 const homeRoute = createRoute({
   getParentRoute: () => shell,
   path: "/",
-  validateSearch: (s: Record<string, unknown>): { page?: number } => ({ page: Number(s.page) > 0 ? Number(s.page) : undefined }),
+  validateSearch: (s: Record<string, unknown>): { page?: number } => {
+    const page = Number(s.page)
+    return { page: Number.isInteger(page) && page > 0 ? page : undefined }
+  },
   component: HomePage,
 })
 
@@ -91,11 +94,14 @@ export type SearchKind = "all" | "folder" | "file"
 const searchRoute = createRoute({
   getParentRoute: () => shell,
   path: "search",
-  validateSearch: (s: Record<string, unknown>): { q: string; kind: SearchKind; page?: number } => ({
-    q: typeof s.q === "string" ? s.q : "",
-    kind: (s.kind === "folder" || s.kind === "file" ? s.kind : "all") as SearchKind,
-    page: Number(s.page) > 1 ? Number(s.page) : undefined,
-  }),
+  validateSearch: (s: Record<string, unknown>): { q: string; kind: SearchKind; page?: number } => {
+    const page = Number(s.page)
+    return {
+      q: typeof s.q === "string" ? s.q : "",
+      kind: (s.kind === "folder" || s.kind === "file" ? s.kind : "all") as SearchKind,
+      page: Number.isInteger(page) && page > 1 ? page : undefined,
+    }
+  },
   component: SearchPage,
 })
 
@@ -108,7 +114,10 @@ const downloadRoute = createRoute({
 const browseRoute = createRoute({
   getParentRoute: () => shell,
   path: "$",
-  validateSearch: (s: Record<string, unknown>): { page?: number } => ({ page: Number(s.page) > 0 ? Number(s.page) : undefined }),
+  validateSearch: (s: Record<string, unknown>): { page?: number } => {
+    const page = Number(s.page)
+    return { page: Number.isInteger(page) && page > 0 ? page : undefined }
+  },
   component: BrowsePage,
 })
 

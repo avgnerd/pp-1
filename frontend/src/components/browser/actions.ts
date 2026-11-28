@@ -18,7 +18,7 @@ export const useActionDialog = create<DialogState>()((set) => ({
   kind: null,
   entries: [],
   open: (kind, entries) => set({ kind, entries }),
-  close: () => set({ kind: null }),
+  close: () => set({ kind: null, entries: [] }),
 }))
 
 export function openInNewTab(path: string, publicUrl: string) {

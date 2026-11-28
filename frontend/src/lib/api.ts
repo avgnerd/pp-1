@@ -134,6 +134,7 @@ export interface ArchiveListing {
 export interface OpFailure {
   path: string
   error: string
+  unknown?: boolean
 }
 
 export interface OpResult {
@@ -172,11 +173,13 @@ export class ApiError extends Error {
   status: number
   code?: string
   field?: string
-  constructor(status: number, message: string, code?: string, field?: string) {
+  unknown?: boolean
+  constructor(status: number, message: string, code?: string, field?: string, unknown?: boolean) {
     super(message)
     this.status = status
     this.code = code
     this.field = field
+    this.unknown = unknown
   }
 }
 
@@ -184,18 +187,20 @@ async function parseErrorResponse(res: Response, dispatchUnauthorized = true): P
   let msg = res.statusText || `요청이 실패했습니다 (HTTP ${res.status})`
   let code: string | undefined
   let field: string | undefined
+  let unknown: boolean | undefined
   try {
     const j = await res.json()
     if (j?.error) msg = j.error
     code = j?.code
     field = j?.field
+    unknown = j?.unknown === true
   } catch {
     /* not JSON */
   }
   if (dispatchUnauthorized && res.status === 401 && (!code || code === "auth_required")) {
     window.dispatchEvent(new CustomEvent("dvfs:unauthorized"))
   }
-  return new ApiError(res.status, msg, code, field)
+  return new ApiError(res.status, msg, code, field, unknown)
 }
 
 function parseContentDispositionFilename(header: string | null, fallback = "dvfs-backup.json"): string {
@@ -245,18 +250,20 @@ async function request<T>(method: string, url: string, body?: unknown, signal?: 
     let msg = `요청이 실패했습니다 (HTTP ${res.status})`
     let code: string | undefined
     let field: string | undefined
+    let unknown: boolean | undefined
     try {
       const j = await res.json()
       if (j?.error) msg = j.error
       code = j?.code
       field = j?.field
+      unknown = j?.unknown === true
     } catch {
       /* not JSON */
     }
     if (res.status === 401 && code === "auth_required") {
       window.dispatchEvent(new CustomEvent("dvfs:unauthorized"))
     }
-    throw new ApiError(res.status, msg, code, field)
+    throw new ApiError(res.status, msg, code, field, unknown)
   }
   if (res.status === 204) return undefined as T
   return (await res.json()) as T
@@ -389,7 +396,7 @@ export const api = {
         body: JSON.stringify({ preview_id: previewId }),
       })
       if (!res.ok) {
-        throw await parseErrorResponse(res, false)
+        throw await parseErrorResponse(res)
       }
       let data: { ok?: boolean; failed_storages?: string[] | null } = {}
       if (res.status !== 204) {
