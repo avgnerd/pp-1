@@ -3,7 +3,6 @@ import { useNavigate } from "@tanstack/react-router"
 import { selectError, usePlayer } from "@videojs/react"
 import { Hls, type HlsJsAdapter } from "@videojs/hlsjs-video"
 import { Audio, AudioPlayer } from "@videojs/react/audio"
-import { HlsAudio } from "@videojs/react/media/hls-audio"
 import { HlsJsVideo } from "@videojs/react/media/hlsjs-video"
 import { Video, VideoPlayer } from "@videojs/react/video"
 import { GlassesIcon, GaugeIcon } from "lucide-react"
@@ -115,7 +114,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
     enabled: !!cfg.data?.probe,
   })
   const probeData = probe.data?.probe
-  const waitingForProbe = !!cfg.data?.probe && probe.isPending
+  const waitingForPlan = cfg.isPending || (!!cfg.data?.probe && probe.isPending)
 
   const [fallback, setFallback] = useState<Plan | null>(null)
   const qNum = quality === "original" ? null : Number(quality)
@@ -123,16 +122,15 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
   // "convert" is a per-file choice in the quality menu; it is never saved as a preference.
   const converting = fallback?.kind === "hls" && fallback.mode === "transcode"
 
-  const [vr, setVr] = useState<VRMode>("off")
-  const vrTouched = useRef(false)
-  useEffect(() => {
-    if (!vrTouched.current && probeData) setVr(initialVR(probeData))
-  }, [probeData])
+  // null means auto: the probe decides now, during this render, rather than in an effect that
+  // follows a first render without it (that render would request the non-proxied original).
+  const [vrOverride, setVrOverride] = useState<VRMode | null>(null)
+  const vr = vrOverride ?? initialVR(probeData)
 
   const hls = useQuery({
     queryKey: ["hls", entry.path, entry.rev, plan.kind === "hls" ? plan.mode : "", plan.kind === "hls" ? plan.height : 0],
     queryFn: () => api.hls(entry.path, (plan as Extract<Plan, { kind: "hls" }>).mode, (plan as Extract<Plan, { kind: "hls" }>).height || 1080),
-    enabled: plan.kind === "hls" && !waitingForProbe,
+    enabled: plan.kind === "hls" && !waitingForPlan,
     staleTime: Infinity,
     gcTime: 5_000,
     retry: false,
@@ -247,6 +245,23 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
   const src = plan.kind === "original" ? urls.raw(entry.path, { proxy: vrOn, fresh }) : hls.data?.playlist
   const playbackSource = JSON.stringify([recoverySource, src, reload])
 
+  // A 410 cannot get better by retrying: stop hls.js and recover right away. The engine exists
+  // only once the adapter starts loading, shortly after it is attached.
+  const hlsMedia = useRef<HlsJsAdapter | null>(null)
+  // past_end stops hls.js so it cannot ask for segments that do not exist. Seeking or playing has
+  // to start it again: hls.js ignores moving out of STOPPED on its own and the adapter does not
+  // reload a source it has already started.
+  const hlsStopped = useRef(false)
+  const resumeStoppedHls = useCallback(() => {
+    if (!hlsStopped.current) return
+    hlsStopped.current = false
+    const el = videoRef.current ?? audioRef.current
+    if (el) hlsMedia.current?.engine?.startLoad(el.currentTime)
+  }, [])
+  useEffect(() => {
+    hlsStopped.current = false
+  }, [playbackSource])
+
   // Watch original playback for dropped frames and switch to server conversion once if the
   // browser cannot keep up with the stream. Skipped for VR (frames go to a canvas), hidden
   // tabs and paused/seeking playback, where browsers drop or skip frames on purpose.
@@ -291,13 +306,17 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
   }, [isAudio, vrOn, plan.kind, transcode, src, probeData, keepPlaying, video])
 
   const mediaEvents = {
-    onPlay: () => { resumePlay.current = true },
+    onPlay: () => {
+      resumePlay.current = true
+      resumeStoppedHls()
+    },
     onPause: (e: React.SyntheticEvent<HTMLMediaElement>) => {
       const el = e.currentTarget
       if (el.isConnected && el.readyState > 0 && !el.error) resumePlay.current = false
     },
     onSeeking: (e: React.SyntheticEvent<HTMLMediaElement>) => {
       if (!restoringFrom.current || restoringFrom.current === e.currentTarget) resumeAt.current = e.currentTarget.currentTime
+      resumeStoppedHls()
     },
     onTimeUpdate: (e: React.SyntheticEvent<HTMLMediaElement>) => {
       if (!restoringFrom.current || restoringFrom.current === e.currentTarget) resumeAt.current = e.currentTarget.currentTime
@@ -399,12 +418,10 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
   useEffect(() => {
     onGone.current = (reportTerminal) => void onEngineFatal(() => {}, reportTerminal)
   }, [onEngineFatal])
-  // A 410 cannot get better by retrying: stop hls.js and recover right away. The engine exists
-  // only once the adapter starts loading, shortly after it is attached.
-  const hlsMedia = useRef<HlsJsAdapter | null>(null)
   const onHlsMedia = useCallback((m: HlsJsAdapter | null) => {
     hlsMedia.current = m
     if (!m) return
+    hlsStopped.current = false
     let off = () => {}
     let timer: ReturnType<typeof setTimeout> | undefined
     const attach = (tries: number) => {
@@ -419,6 +436,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
         // past_end is the media ending while the session is still alive; only a gone session needs
         // another one.
         if (hlsErrorCode(data.networkDetails) === "past_end") {
+          hlsStopped.current = true
           endHlsPlayback()
           return
         }
@@ -450,6 +468,10 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
         ]
       : []),
   ]
+  // A saved quality may not exist for this file (720p on a 480p source, or none while conversion
+  // is off). The radio group has to point at a choice it renders.
+  const qualityValue = converting ? "convert" : quality
+  const settingsQuality = qualityChoices.some((c) => c.value === qualityValue) ? qualityValue : "original"
 
   const slots: PlayerSlots = {
     retryPlayback: plan.kind === "hls" && failedSource === playbackSource ? retryHls : undefined,
@@ -467,7 +489,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
         <ChoiceSubmenu
           icon={<GaugeIcon />}
           title="화질"
-          value={converting ? "convert" : quality}
+          value={settingsQuality}
           choices={qualityChoices}
           onChange={(v) => {
             keepPlaying()
@@ -497,8 +519,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
           ]}
           onChange={(v) => {
             keepPlaying()
-            vrTouched.current = true
-            setVr(v as VRMode)
+            setVrOverride(v as VRMode)
           }}
         />
       </>
@@ -517,7 +538,7 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
       </p>
     ) : null
 
-  if (waitingForProbe) return <Skeleton className={isAudio ? "h-24 w-full" : "aspect-video w-full"} />
+  if (waitingForPlan) return <Skeleton className={isAudio ? "h-24 w-full" : "aspect-video w-full"} />
 
   if (plan.kind === "hls" && hls.isError) {
     return (
@@ -540,7 +561,11 @@ export default function MediaPlayer({ entry, siblings }: { entry: Entry; sibling
           <AudioPlayer title={entry.name}>
             <AudioSkin className="w-full" style={{ "--media-accent-color": "var(--primary)" } as React.CSSProperties}>
               {!src ? null : plan.kind === "hls" ? (
-                <HlsAudio key={mediaKey} ref={audioRef} src={src} autoPlay={autoPlay} {...mediaEvents} />
+                // HlsAudio runs @videojs/spf's multivariant parser, which ignores a single media
+                // playlist like the one this server returns, so it never loads a segment. The
+                // hls.js adapter parses that playlist directly; the video stays hidden because the
+                // audio skin draws the UI and the element only has to produce sound.
+                <HlsJsVideo key={mediaKey} ref={onVideo} mediaRef={onHlsMedia} source={{ src, engine: hlsEngine }} autoPlay={autoPlay} className="hidden" {...mediaEvents} />
               ) : (
                 <Audio key={mediaKey} ref={audioRef} src={src} autoPlay={autoPlay} preload="metadata" {...mediaEvents} />
               )}
