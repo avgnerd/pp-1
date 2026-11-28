@@ -363,6 +363,26 @@ func TestGetOrLoadDoesNotPublishAcrossRemoval(t *testing.T) {
 	}
 }
 
+// SetIfCurrent applies the same rule to a caller-driven load: a write captured before a removal is
+// dropped, while a capture taken after the removal is allowed to cache.
+func TestSetIfCurrentPublishesOnlyAtCapturedGeneration(t *testing.T) {
+	c := New(1000, 1<<20, time.Hour)
+	defer c.Stop()
+
+	stale := c.InvalidationGeneration()
+	c.Clear()
+	c.SetIfCurrent(stale, "dir:/x", "stale", 5, time.Hour)
+	if v, ok := c.Get("dir:/x"); ok {
+		t.Fatalf("removal after capture did not stop the publish: cached %v", v)
+	}
+
+	current := c.InvalidationGeneration()
+	c.SetIfCurrent(current, "dir:/x", "fresh", 5, time.Hour)
+	if v, ok := c.Get("dir:/x"); !ok || v.(string) != "fresh" {
+		t.Fatalf("capture after the removal did not publish: got %v, cached %v", v, ok)
+	}
+}
+
 // A caller that arrives after a removal must start its own load. Joining the load in flight when
 // the removal ran would hand it the pre-removal value.
 func TestGetOrLoadStartsFreshLoadAfterRemoval(t *testing.T) {
