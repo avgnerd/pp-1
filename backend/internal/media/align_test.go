@@ -128,66 +128,94 @@ func TestStaleSegmentsDoNotRestartRun(t *testing.T) {
 }
 
 // A paused player gives its transcode slot back, so a forgotten tab cannot block everyone
-// else; it takes a slot again on resume. Different players never share a session.
+// else; it takes a slot again on resume. Different players never share a session. The shim
+// subtest runs the same behavior through a launcher process, like the deployed wrapper.
 func TestPausedSessionFreesSlot(t *testing.T) {
 	url := sample(t, "avi", "-c:v", "mpeg4", "-q:v", "5", "-c:a", "mp3")
-	m := newManager(tool(t, "ffmpeg"), filepath.Join(t.TempDir(), "hls"), 1, 300*time.Millisecond)
-	defer m.Close()
-	src := Source{Key: "k", Client: "tab1", URL: func(context.Context) (string, error) { return url, nil }, Duration: 30, Mode: ModeTranscode, Height: 360, SrcH: 720}
-	a, err := m.Open(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	if _, err := a.Segment(ctx, 0); err != nil {
-		t.Fatal(err)
-	}
-	if again, _ := m.Open(src); again != a {
-		t.Fatal("the same player should get its session back")
-	}
-	// The player stays open (paused) for the rest of the test.
-	beat := make(chan struct{})
-	defer close(beat)
-	go func() {
-		for {
-			select {
-			case <-beat:
-				return
-			case <-time.After(50 * time.Millisecond):
-				a.Heartbeat()
+	for _, tc := range []struct {
+		name string
+		shim bool
+	}{{name: "real"}, {name: "shim", shim: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ff := tool(t, "ffmpeg")
+			var pidFile string
+			if tc.shim {
+				ff, pidFile = useShim(t, ff)
 			}
-		}
-	}()
-	for i := 0; ; i++ {
-		if active, _, _ := m.Limit.Stats(); active == 0 {
-			break
-		}
-		if i > 100 {
-			t.Fatal("paused session kept its slot")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	for k := 1; k < a.Segments(); k++ {
-		_ = os.Remove(a.segPath(k))
-	}
-	src.Client = "tab2"
-	b, err := m.Open(src)
-	if err != nil {
-		t.Fatalf("second player blocked by a paused one: %v", err)
-	}
-	if b == a {
-		t.Fatal("two players share one session")
-	}
-	if _, err := b.Segment(ctx, 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.Segment(ctx, 5); !errors.Is(err, ErrBusy) {
-		t.Fatalf("resume while the slot is taken: got %v, want ErrBusy", err)
-	}
-	b.Close()
-	if _, err := a.Segment(ctx, 5); err != nil {
-		t.Fatalf("resume after the slot was freed: %v", err)
+			m := newManager(ff, filepath.Join(t.TempDir(), "hls"), 1, 300*time.Millisecond)
+			t.Cleanup(m.Close)
+			if pidFile != "" {
+				// Kill surviving launcher children before m.Close removes the session dirs.
+				t.Cleanup(func() { killShimPIDs(pidFile) })
+			}
+			src := Source{Key: "k", Client: "tab1", URL: func(context.Context) (string, error) { return url, nil }, Duration: 30, Mode: ModeTranscode, Height: 360, SrcH: 720}
+			a, err := m.Open(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			if _, err := a.Segment(ctx, 0); err != nil {
+				t.Fatal(err)
+			}
+			if again, _ := m.Open(src); again != a {
+				t.Fatal("the same player should get its session back")
+			}
+			// The player stays open (paused) for the rest of the test.
+			beat := make(chan struct{})
+			defer close(beat)
+			go func() {
+				for {
+					select {
+					case <-beat:
+						return
+					case <-time.After(50 * time.Millisecond):
+						a.Heartbeat()
+					}
+				}
+			}()
+			deadline := time.Now().Add(15 * time.Second)
+			for {
+				if active, _, _ := m.Limit.Stats(); active == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("paused session kept its slot")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			for k := 1; k < a.Segments(); k++ {
+				if err := os.Remove(a.segPath(k)); err != nil && !os.IsNotExist(err) {
+					t.Fatalf("remove leftover segment %s: %v", a.segPath(k), err)
+				}
+			}
+			src.Client = "tab2"
+			b, err := m.Open(src)
+			if err != nil {
+				t.Fatalf("second player blocked by a paused one: %v", err)
+			}
+			if b == a {
+				t.Fatal("two players share one session")
+			}
+			if _, err := b.Segment(ctx, 0); err != nil {
+				t.Fatal(err)
+			}
+			b.Close()
+			// Hold the single slot directly so the ErrBusy check does not depend on how long
+			// B's encoder happens to keep running.
+			if !m.Limit.TryAcquire() {
+				t.Fatal("slot was not free after B closed")
+			}
+			_, err = a.Segment(ctx, 5)
+			if !errors.Is(err, ErrBusy) {
+				m.Limit.Release()
+				t.Fatalf("resume while the slot is taken: got %v, want ErrBusy", err)
+			}
+			m.Limit.Release()
+			if _, err := a.Segment(ctx, 5); err != nil {
+				t.Fatalf("resume after the slot was freed: %v", err)
+			}
+		})
 	}
 }
 

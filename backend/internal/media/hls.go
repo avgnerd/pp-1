@@ -60,6 +60,7 @@ type Session struct {
 	lifeCancel context.CancelFunc
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
+	runTree    procTree  // OS handle for the current run's process tree
 	runStart   int       // first segment of the current ffmpeg run
 	runAt      time.Time // when the current run started; older segment files are leftovers
 	runOK      bool      // the current run exited successfully; its init file is complete
@@ -827,24 +828,43 @@ func (s *Session) stopRun(keepSlot bool) {
 	s.mu.Lock()
 	cancel := s.cancel
 	exited := s.exited
+	tree := s.runTree
 	s.cmd = nil
 	s.cancel = nil
+	s.runTree = nil
 	release := s.slot && !keepSlot
 	if release {
 		s.slot = false
 	}
 	s.mu.Unlock()
-	if release {
-		s.mgr.Limit.Release()
+
+	// Kill the whole tree before waiting: canceling the context only kills the direct child,
+	// which may be a launcher that leaves the real ffmpeg running and holding inherited pipes.
+	if tree != nil {
+		tree.Kill()
 	}
 	if cancel != nil {
 		cancel()
-		if exited != nil {
-			select {
-			case <-exited:
-			case <-time.After(5 * time.Second):
-			}
+	}
+	deadline := time.Now().Add(runTreeWait)
+	if exited != nil {
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-exited:
+		case <-timer.C:
 		}
+		timer.Stop()
+	}
+	if tree != nil {
+		if !tree.Wait(deadline) {
+			slog.Warn("ffmpeg process tree did not exit before the slot was released", "session", s.ID)
+		}
+		// Closing the job is the backstop for a process that ignored the kill; on Unix this
+		// only releases bookkeeping because the group already received SIGKILL.
+		tree.Close()
+	}
+	if release {
+		s.mgr.Limit.Release()
 	}
 }
 
@@ -1002,24 +1022,48 @@ func (s *Session) start(n int) error {
 	cmd.Dir = s.dir
 	hideWindow(cmd)
 	cmd.WaitDelay = 3 * time.Second
+	tree, err := newProcTree(cmd)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("ffmpeg 프로세스 트리를 만들지 못했습니다: %w", err)
+	}
+	cmd.Cancel = func() error {
+		tree.Kill()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		return nil
+	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		tree.Close()
 		cancel()
 		return err
 	}
 	runAt, err := s.runBoundary()
 	if err != nil {
+		tree.Close()
 		cancel()
 		return fmt.Errorf("변환 시작 시각을 읽지 못했습니다: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
+		tree.Close()
 		cancel()
 		return fmt.Errorf("ffmpeg 실행 실패: %w", err)
+	}
+	if err := tree.Attach(cmd); err != nil {
+		tree.Kill()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		tree.Close()
+		cancel()
+		return fmt.Errorf("ffmpeg 프로세스 트리를 붙이지 못했습니다: %w", err)
 	}
 	exited := make(chan struct{})
 	s.mu.Lock()
 	s.cmd = cmd
 	s.cancel = cancel
+	s.runTree = tree
 	s.runStart = startNum
 	s.runAt = runAt
 	s.runOK = false
@@ -1073,13 +1117,22 @@ func (s *Session) start(n int) error {
 		}
 		release := false
 		if s.cmd == cmd {
-			// Finished (or crashed) on its own: nothing is encoding, so free the slot.
+			// Finished (or crashed) on its own: the direct child is gone, but a launcher may
+			// have left the real encoder behind. Free the slot only after the whole tree dies.
 			s.cmd = nil
 			s.cancel = nil
+			s.runTree = nil
 			release = s.slot
 			s.slot = false
 		}
 		s.mu.Unlock()
+		if tree != nil {
+			tree.Kill()
+			if !tree.Wait(time.Now().Add(runTreeWait)) {
+				slog.Warn("ffmpeg process tree did not exit after the run", "session", s.ID)
+			}
+			tree.Close()
+		}
 		if release {
 			s.mgr.Limit.Release()
 		}
