@@ -607,7 +607,10 @@ func (m *Manager) Reauth(id int64, mode string) (*AuthStart, error) {
 }
 
 func (m *Manager) startAuth(id int64, mode, redirect string) (*AuthStart, error) {
-	s, _ := m.Get(id)
+	s, ok := m.Get(id)
+	if !ok {
+		return nil, ErrNotFound
+	}
 	state, err := secret.RandomToken(32)
 	if err != nil {
 		return nil, err
@@ -617,6 +620,13 @@ func (m *Manager) startAuth(id int64, mode, redirect string) (*AuthStart, error)
 	}
 	if _, err := m.db.Exec(`INSERT INTO oauth_states(state_hash, storage_id, redirect_uri, expires_at) VALUES(?,?,?,?)`,
 		secret.HashToken(state), id, redirect, m.now().Add(StateTTL).Unix()); err != nil {
+		// Delete does not wait for this mutation, so it can remove the row after the snapshot
+		// check above and leave the insert's foreign key to fail. Ask the database, not the
+		// possibly stale snapshot, whether the row survived.
+		var exists int
+		if lookupErr := m.db.QueryRow(`SELECT 1 FROM storages WHERE id = ?`, id).Scan(&exists); errors.Is(lookupErr, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 	return &AuthStart{Storage: s, AuthorizeURL: dropbox.AuthorizeURL(m.ep, s.AppKey, redirect, state), RedirectURI: redirect}, nil
@@ -835,7 +845,10 @@ func (m *Manager) complete(ctx context.Context, id int64, code, redirect string)
 		return Storage{}, err
 	}
 	m.changed(id)
-	s, _ = m.Get(id)
+	s, ok := m.Get(id)
+	if !ok {
+		return Storage{}, ErrNotFound
+	}
 	return s, nil
 }
 
@@ -912,7 +925,10 @@ func (m *Manager) Update(id int64, in Input) (Storage, error) {
 		return Storage{}, err
 	}
 	m.changed(id)
-	s, _ := m.Get(id)
+	s, ok := m.Get(id)
+	if !ok {
+		return Storage{}, ErrNotFound
+	}
 	return s, nil
 }
 
