@@ -63,6 +63,7 @@ type Session struct {
 	runStart   int       // first segment of the current ffmpeg run
 	runAt      time.Time // when the current run started; older segment files are leftovers
 	runOK      bool      // the current run exited successfully; its init file is complete
+	runHigh    int       // highest segment the current run produced before cleanup (or -1)
 	slot       bool      // holds a transcode slot (while ffmpeg runs, or right after Open)
 	endSeg     int       // first segment past the real end of the media (0 = not known)
 	exited     chan struct{}
@@ -173,7 +174,7 @@ func (m *Manager) Open(src Source) (*Session, error) {
 	}
 	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 	s := &Session{ID: id, src: src, dir: dir, mgr: m, lastAccess: time.Now(), lastBeat: time.Now(), lastSeg: -1, slot: true,
-		segments: segmentCount(src.Duration), pins: map[int]int{}, lifeCtx: lifeCtx, lifeCancel: lifeCancel}
+		segments: segmentCount(src.Duration), pins: map[int]int{}, lifeCtx: lifeCtx, lifeCancel: lifeCancel, runHigh: -1}
 	m.sessions[id] = s
 	m.byKey[key] = s
 	m.mu.Unlock()
@@ -255,7 +256,11 @@ func (m *Manager) reaper(idle time.Duration) {
 				case s.active > 0:
 					// A request is waiting for ffmpeg; never reap under it.
 				case sinceUse > idle && sinceBeat > 3*idle:
-					// No requests and no open player: the tab is gone.
+					// No requests and no open player: the tab is gone. Marking it closed and
+					// unregistering it under m.mu+s.mu is what makes the decision final: Open
+					// looks sessions up under m.mu, so it can never hand out a session selected
+					// here. Teardown runs after both locks are released.
+					m.expireLocked(s)
 					gone = append(gone, s)
 				case sinceUse > idle && (s.cmd != nil || s.slot):
 					// The player is open but paused: stop encoding and free the slot, keep the session.
@@ -295,6 +300,19 @@ func (m *Manager) reaper(idle time.Duration) {
 				}
 				s.startMu.Unlock()
 			}
+		}
+	}
+}
+
+// expireLocked marks s closed and removes it from the manager maps. The caller holds m.mu and
+// s.mu, the same pair Open holds while it looks a session up, so Open can no longer return it.
+// The caller still runs s.Close() after releasing both locks to stop ffmpeg and remove the files.
+func (m *Manager) expireLocked(s *Session) {
+	s.closed = true
+	delete(m.sessions, s.ID)
+	for k, v := range m.byKey {
+		if v == s {
+			delete(m.byKey, k)
 		}
 	}
 }
@@ -721,11 +739,26 @@ func (s *Session) cleanupOldLocked(n int) {
 	if s.cmd != nil {
 		keep = s.runStart
 	}
+	runAt := s.runAt
 	pinned := make(map[int]struct{}, len(s.pins))
 	for k := range s.pins {
 		pinned[k] = struct{}{}
 	}
 	s.mu.Unlock()
+
+	// Record how far the current run got before deleting anything. The run may still be encoding,
+	// and its exit path needs this evidence to know where the media really ends: the files
+	// removed here are still segments of the media. Without a live run there is no exit path left
+	// to inform.
+	if keep >= 0 {
+		if hi := s.highestSegment(runAt); hi >= 0 {
+			s.mu.Lock()
+			if hi > s.runHigh {
+				s.runHigh = hi
+			}
+			s.mu.Unlock()
+		}
+	}
 
 	entries, _ := os.ReadDir(s.dir)
 	for _, e := range entries {
@@ -768,6 +801,7 @@ func (s *Session) waitFor(ctx context.Context, p string) error {
 				// for the current one (the request context ends it if the player gave up).
 				s.mu.Lock()
 				replaced := s.exited != exited || s.restarting
+				tail = s.stderrTail
 				s.mu.Unlock()
 				if replaced {
 					break
@@ -856,14 +890,28 @@ func (s *Session) Args(inputURL string, n, startNum int, offset float64) []strin
 		if h <= 0 {
 			h = 1080
 		}
-		vf := "format=yuv420p"
-		if s.src.SrcH == 0 || s.src.SrcH > h {
+		// yuv420p needs even dimensions in both directions: libx264 exits 1 on an odd height,
+		// and an even requested height leaves an odd source odd when no scale is applied.
+		h &^= 1
+		if h < 2 {
+			h = 2
+		}
+		vf := "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+		if s.src.SrcH == 0 {
+			// Without a probed source height, an odd input height reaches this branch untouched:
+			// scale=-2 only makes the width even. Even the height inside the filter instead.
+			vf = fmt.Sprintf("scale=-2:'min(%d,trunc(ih/2)*2)',format=yuv420p", h)
+		} else if s.src.SrcH > h {
 			vf = fmt.Sprintf("scale=-2:'min(%d,ih)',format=yuv420p", h)
 		}
+		// t and n_forced are both relative to the run's first frame, even with -copyts and
+		// -start_at_zero, so every run uses the same expression. Adding startNum suppressed every
+		// forced keyframe until t caught up and broke the 4 s segment cadence.
+		keyFrames := fmt.Sprintf("expr:gte(t,n_forced*%d)", SegmentSeconds)
 		args = append(args, "-map", "0:V:0", "-map", "0:a:0?",
 			"-c:v", "libx264", "-preset", preset, "-crf", "21", "-maxrate", "10M", "-bufsize", "20M",
 			"-profile:v", "high", "-level:v", "4.1", "-vf", vf,
-			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", SegmentSeconds),
+			"-force_key_frames", keyFrames,
 			"-sc_threshold", "0", "-threads", "0",
 			"-c:a", "aac", "-b:a", "192k", "-ac", "2")
 	}
@@ -975,6 +1023,7 @@ func (s *Session) start(n int) error {
 	s.runStart = startNum
 	s.runAt = runAt
 	s.runOK = false
+	s.runHigh = -1
 	s.exited = exited
 	s.stderrTail = ""
 	s.mu.Unlock()
@@ -988,13 +1037,30 @@ func (s *Session) start(n int) error {
 				tail = tail[1:]
 			}
 		}
+		// Wait closes the read end of the pipe only after the child exits, and the child blocks
+		// writing once the pipe fills: a scanner that stopped at its line or byte limit must
+		// drain the rest here, or a chatty ffmpeg never exits and Wait never returns.
+		_, _ = io.Copy(io.Discard, stderr)
 		err := cmd.Wait()
 		// A run that read the whole input ends the media: segments it did not write after its
 		// last one never exist (only trusted near the end, a cut connection can also exit 0).
+		// Cleanup may delete the tail while the run is still alive, so the run's last segment is
+		// the larger of what is on disk and the high-water mark cleanup recorded before deleting.
+		// The directory is read first: cleanup stores its mark before it removes any file, so a
+		// scan that starts after a deletion still finds the mark.
 		end := 0
 		if err == nil && ctx.Err() == nil {
-			if e := max(s.highestSegment(runAt)+1, startNum); e < s.segments && e >= s.segments-3 {
-				end = e
+			hi := s.highestSegment(runAt)
+			s.mu.Lock()
+			current := s.exited == exited
+			if s.runHigh > hi {
+				hi = s.runHigh
+			}
+			s.mu.Unlock()
+			if current {
+				if e := max(hi+1, startNum); e < s.segments && e >= s.segments-3 {
+					end = e
+				}
 			}
 		}
 		s.mu.Lock()
@@ -1002,7 +1068,7 @@ func (s *Session) start(n int) error {
 		if s.exited == exited && err == nil && ctx.Err() == nil {
 			s.runOK = true
 		}
-		if end > 0 && (s.endSeg == 0 || end < s.endSeg) {
+		if s.exited == exited && end > 0 && (s.endSeg == 0 || end < s.endSeg) {
 			s.endSeg = end
 		}
 		release := false

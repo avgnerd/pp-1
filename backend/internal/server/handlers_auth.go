@@ -129,15 +129,15 @@ func (s *Server) putSettings(c *gin.Context) {
 func (s *Server) clientConfig(c *gin.Context) {
 	st := s.Settings.Get()
 	c.JSON(200, gin.H{
-		"pagination_type":  st.PaginationType,
-		"per_page":         st.PerPage,
-		"audio_autoplay":   st.AudioAutoplay,
-		"video_autoplay":   st.VideoAutoplay,
-		"archive_preview":  st.ArchivePreview,
-		"data_mode":        st.DataMode,
-		"public_url":       s.Cfg.PublicURL,
-		"transcode":        s.HLS.Available() && st.TranscodeConcurrency > 0,
-		"probe":            s.Prober.Available(),
+		"pagination_type": st.PaginationType,
+		"per_page":        st.PerPage,
+		"audio_autoplay":  st.AudioAutoplay,
+		"video_autoplay":  st.VideoAutoplay,
+		"archive_preview": st.ArchivePreview,
+		"data_mode":       st.DataMode,
+		"public_url":      s.Cfg.PublicURL,
+		"transcode":       s.HLS.Available() && s.Prober.Available() && st.TranscodeConcurrency > 0,
+		"probe":           s.Prober.Available(),
 	})
 }
 

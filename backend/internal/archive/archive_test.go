@@ -95,11 +95,13 @@ func TestTar(t *testing.T) {
 
 func TestTgzBudget(t *testing.T) {
 	data := makeTar(t, true)
-	l, err := archive.List("tgz", bytes.NewReader(data), int64(len(data)), int64(len(data)))
+	// The budget bounds the decompressed stream for tgz, so passing the compressed size is no
+	// longer a full-size budget: the fixture expands to 5 MiB from a few KB.
+	l, err := archive.List("tgz", bytes.NewReader(data), int64(len(data)), 64<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(l.Entries) != 6 {
+	if len(l.Entries) != 6 || l.Truncated {
 		t.Fatalf("tgz %+v", l)
 	}
 	l, err = archive.List("tgz", bytes.NewReader(data), int64(len(data)), 100)

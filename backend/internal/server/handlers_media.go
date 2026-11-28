@@ -93,8 +93,9 @@ func (s *Server) probe(c *gin.Context) {
 		link = l
 	}
 	// Both branches report the same availability: the player decides whether it can offer
-	// transcode from this flag, whether or not ffprobe answered.
-	transcode := s.HLS.Available() && s.Settings.Get().TranscodeConcurrency > 0
+	// transcode from this flag, whether or not ffprobe answered. Opening a transcode session needs
+	// ffprobe for the duration, so a server with ffmpeg alone must not advertise it.
+	transcode := s.HLS.Available() && s.Prober.Available() && s.Settings.Get().TranscodeConcurrency > 0
 	pr, err := s.Prober.Probe(ctx, e.ID, e.Rev, e.Name, link)
 	if err != nil {
 		// Probing failure should not block original playback.
@@ -126,6 +127,11 @@ func (s *Server) hlsOpen(c *gin.Context) {
 	}
 	if in.Height <= 0 || in.Height > 2160 {
 		in.Height = 1080
+	}
+	// libx264 with yuv420p exits 1 on an odd height; the request may name one.
+	in.Height &^= 1
+	if in.Height < 2 {
+		in.Height = 2
 	}
 	e, t, ok := s.fileTarget(c, in.Path)
 	if !ok {
